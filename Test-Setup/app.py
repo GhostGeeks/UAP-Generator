@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+import os
+os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
+
+import time
+import math
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+from gpiozero import Button
+from luma.core.interface.serial import i2c
+from luma.oled.device import ssd1306
+from luma.core.render import canvas
+
+# =====================================================
+# CONFIG
+# =====================================================
+I2C_PORT = 1
+I2C_ADDR = 0x3C
+OLED_W, OLED_H = 128, 64
+
+# Buttons (BCM)
+BTN_UP = 17
+BTN_DOWN = 27
+BTN_SELECT = 22
+BTN_BACK = 23
+
+# Hold timings
+SELECT_HOLD_SECONDS = 1.0
+BACK_REBOOT_HOLD = 2.0
+BACK_POWEROFF_HOLD = 5.0
+
+HOME = Path("/home/ghostgeeks01")
+APP_DIR = HOME / "oled"
+MODULE_DIR = APP_DIR / "modules"
+SD_TEST_FILE = APP_DIR / ".sd_write_test"
+
+SPLASH_MIN_SECONDS = 5.0
+SPLASH_FRAME_SLEEP = 0.08
+
+# =====================================================
+# OLED
+# =====================================================
+serial = i2c(port=I2C_PORT, address=I2C_ADDR)
+device = ssd1306(serial, width=OLED_W, height=OLED_H)
+
+# =====================================================
+# UTILITIES
+# =====================================================
+def sd_write_check() -> Optional[str]:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        SD_TEST_FILE.write_text("ok\n")
+        SD_TEST_FILE.unlink(missing_ok=True)
+        return None
+    except Exception as e:
+        return str(e)
+
+def get_ip() -> str:
+    try:
+        ips = subprocess.check_output(["hostname", "-I"], text=True).split()
+        for ip in ips:
+            if ip.count(".") == 3 and not ip.startswith("169.254"):
+                return ip
+        return ""
+    except Exception:
+        return ""
+
+def hostname() -> str:
+    return subprocess.getoutput("hostname").strip()
+
+def uptime_short() -> str:
+    return subprocess.getoutput("uptime -p").replace("up ", "").strip()
+
+def oled_message(title: str, lines: List[str], footer: str = ""):
+    with canvas(device) as draw:
+        draw.text((0, 0), title[:21], fill=255)
+        draw.line((0, 12, 127, 12), fill=255)
+        y = 16
+        for ln in lines[:3]:
+            draw.text((0, y), ln[:21], fill=255)
+            y += 12
+        if footer:
+            draw.text((0, 56), footer[:21], fill=255)
+
+def draw_waveform(draw, phase):
+    mid = 40
+    amp = 10
+    pts = []
+    for x in range(120):
+        t = (x / 120) * (2 * math.pi)
+        y = math.sin(t * 2 + phase)
+        pts.append((4 + x, int(mid - y * amp)))
+    draw.rectangle((2, 26, 125, 53), outline=255)
+    draw.line(pts, fill=255)
+
+# =====================================================
+# BUTTONS
+# =====================================================
+def init_buttons():
+    events = {
+        "up": False,
+        "down": False,
+        "select": False,
+        "select_hold": False,
+        "back": False,
+    }
+
+    btn_up = Button(BTN_UP, pull_up=True, bounce_time=0.06)
+    btn_down = Button(BTN_DOWN, pull_up=True, bounce_time=0.06)
+
+    btn_select = Button(BTN_SELECT, pull_up=True, bounce_time=0.06, hold_time=SELECT_HOLD_SECONDS)
+    btn_back = Button(BTN_BACK, pull_up=True, bounce_time=0.06)
+
+    btn_up.when_pressed = lambda: events.__setitem__("up", True)
+    btn_down.when_pressed = lambda: events.__setitem__("down", True)
+
+    btn_select.when_pressed = lambda: events.__setitem__("select", True)
+    btn_select.when_held = lambda: events.__setitem__("select_hold", True)
+
+    btn_back.when_pressed = lambda: events.__setitem__("back", True)
+
+    def consume(k):
+        if events[k]:
+            events[k] = False
+            return True
+        return False
+
+    def clear():
+        for k in events:
+            events[k] = False
+
+    # IMPORTANT: return button objects so they stay alive
+    return consume, clear, (btn_up, btn_down, btn_select, btn_back)
+
+
+# =====================================================
+# MODULES
+# =====================================================
+@dataclass
+class Module:
+    name: str
+    subtitle: str
+    cmd: List[str]
+
+MODULES = [
+    Module("Status", "IP / Time", ["python", str(MODULE_DIR / "status.py")]),
+    Module("ITC", "Recorder", ["python", str(MODULE_DIR / "itc.py")]),
+    Module("Ghost TV", "Camera", ["python", str(MODULE_DIR / "ghost_tv.py")]),
+    Module("Sensors", "EMF / Temp", ["python", str(MODULE_DIR / "sensors.py")]),
+]
+
+def ensure_modules():
+    MODULE_DIR.mkdir(exist_ok=True)
+    status = MODULE_DIR / "status.py"
+    if not status.exists():
+        status.write_text(
+            "import time, subprocess\n"
+            "from luma.core.interface.serial import i2c\n"
+            "from luma.oled.device import ssd1306\n"
+            "from luma.core.render import canvas\n"
+            "device = ssd1306(i2c(1,0x3C),128,64)\n"
+            "def ip(): return subprocess.getoutput('hostname -I').split()[0]\n"
+            "while True:\n"
+            "  with canvas(device) as d:\n"
+            "    d.text((0,0),'STATUS',fill=255)\n"
+            "    d.line((0,12,127,12),fill=255)\n"
+            "    d.text((0,18),f'IP {ip()}',fill=255)\n"
+            "    d.text((0,32),time.strftime('%H:%M:%S'),fill=255)\n"
+            "    d.text((0,56),'BACK exits',fill=255)\n"
+            "  time.sleep(1)\n"
+        )
+
+# =====================================================
+# UI SCREENS
+# =====================================================
+def splash():
+    start = time.time()
+    phase = 0
+    while True:
+        with canvas(device) as draw:
+            draw.text((0, 2), "GHOST GEEKS", fill=255)
+            draw.text((0, 14), "REAL GHOST GEAR", fill=255)
+            draw.text((0, 56), "BOOTING UP THE LAB...", fill=255)
+            draw_waveform(draw, phase)
+        phase += 0.15
+        if time.time() - start >= SPLASH_MIN_SECONDS and get_ip():
+            return
+        time.sleep(SPLASH_FRAME_SLEEP)
+
+def draw_menu(idx):
+    with canvas(device) as draw:
+        draw.text((0, 0), "GHOST GEEKS MENU", fill=255)
+        draw.line((0, 12, 127, 12), fill=255)
+        for i in range(len(MODULES)):
+            prefix = ">" if i == idx else " "
+            draw.text((0, 16 + i * 12), f"{prefix} {MODULES[i].name}", fill=255)
+        draw.text((0, 56), "SEL run  HOLD=cfg", fill=255)
+
+# =====================================================
+# POWER CONFIRM
+# =====================================================
+def confirm_action(label, consume, clear):
+    clear()
+    end = time.time() + 3
+    while True:
+        remaining = int(end - time.time()) + 1
+        if remaining <= 0:
+            return True
+        oled_message(label, [f"Confirm in {remaining}s", "Tap BACK to cancel", ""])
+        if consume("back"):
+            oled_message("CANCELLED", ["Returning...", "", ""])
+            time.sleep(0.5)
+            clear()
+            return False
+        time.sleep(0.05)
+
+def reboot():
+    oled_message("REBOOT", ["Rebooting...", "", ""])
+    subprocess.Popen(["sudo", "-n", "systemctl", "reboot"])
+
+def poweroff():
+    oled_message("POWEROFF", ["Shutting down...", "", ""])
+    subprocess.Popen(["sudo", "-n", "systemctl", "poweroff"])
+
+# =====================================================
+# MODULE RUNNER
+# =====================================================
+def run_module(mod, consume, clear):
+    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = menu")
+    proc = subprocess.Popen(mod.cmd)
+    while proc.poll() is None:
+        if consume("back"):
+            proc.terminate()
+            break
+        time.sleep(0.05)
+    clear()
+
+# =====================================================
+# SETTINGS
+# =====================================================
+def settings(consume, clear):
+    clear()
+    while True:
+        oled_message(
+            "SETTINGS",
+            [hostname(), f"IP {get_ip()}", f"UP {uptime_short()}"],
+            "BACK = menu",
+        )
+        if consume("back"):
+            clear()
+            return
+        time.sleep(0.1)
+
+# =====================================================
+# MAIN
+# =====================================================
+def main():
+    if err := sd_write_check():
+        oled_message("SD ERROR", [err[:21]], "")
+        while True:
+            time.sleep(1)
+
+    ensure_modules()
+    consume, clear, btn_back = init_buttons()
+
+    splash()
+    idx = 0
+    draw_menu(idx)
+
+    back_pressed_at = None
+
+    while True:
+        if consume("up"):
+            idx = (idx - 1) % len(MODULES)
+            draw_menu(idx)
+
+        if consume("down"):
+            idx = (idx + 1) % len(MODULES)
+            draw_menu(idx)
+
+        if consume("select"):
+            run_module(MODULES[idx], consume, clear)
+            draw_menu(idx)
+
+        if consume("select_hold"):
+            settings(consume, clear)
+            draw_menu(idx)
+
+        # BACK holds
+        if btn_back.is_pressed:
+            if back_pressed_at is None:
+                back_pressed_at = time.time()
+            held = time.time() - back_pressed_at
+
+            if held >= BACK_POWEROFF_HOLD:
+                if confirm_action("POWEROFF?", consume, clear):
+                    poweroff()
+                    return
+                back_pressed_at = None
+
+            elif held >= BACK_REBOOT_HOLD:
+                if confirm_action("REBOOT?", consume, clear):
+                    reboot()
+                    return
+                back_pressed_at = None
+        else:
+            back_pressed_at = None
+
+        time.sleep(0.02)
+
+if __name__ == "__main__":
+    main()
