@@ -264,7 +264,9 @@ def main():
             time.sleep(1)
 
     ensure_modules()
-    consume, clear, btn_back = init_buttons()
+    consume, clear, buttons = init_buttons()
+    btn_up, btn_down, btn_select, btn_back = buttons
+
 
     splash()
     idx = 0
