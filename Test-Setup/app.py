@@ -236,7 +236,7 @@ def draw_menu(mods: List[Module], idx: int):
             prefix = ">" if i == idx else " "
             draw.text((0, 16 + row * 12), f"{prefix} {mods[i].name}"[:21], fill=255)
 
-        draw.text((0, 56), "SEL run  HOLD=cfg", fill=255)
+        draw.text((0, 54), "SEL run  HOLD=cfg", fill=255)
 
 # =====================================================
 # POWER CONFIRM
