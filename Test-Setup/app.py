@@ -51,9 +51,14 @@ device = ssd1306(serial, width=OLED_W, height=OLED_H)
 # UTILITIES
 # =====================================================
 def sd_write_check() -> Optional[str]:
+    """
+    Basic check to confirm we can write to the filesystem.
+    If this fails, something is seriously wrong (read-only fs, bad mount, etc.)
+    """
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         SD_TEST_FILE.write_text("ok\n")
+        # Python <3.8 doesn't support missing_ok; you are on newer so it's fine.
         SD_TEST_FILE.unlink(missing_ok=True)
         return None
     except Exception as e:
@@ -136,26 +141,40 @@ def init_buttons():
     # IMPORTANT: return button objects so they stay alive
     return consume, clear, (btn_up, btn_down, btn_select, btn_back)
 
-
 # =====================================================
 # MODULES
 # =====================================================
-MODULE_DIR = Path.home() / "oled" / "modules"
+@dataclass
+class Module:
+    id: str
+    name: str
+    subtitle: str
+    entry_path: str
+    order: int = 999
 
-def discover_modules(modules_root: Path):
-    mods = []
+def ensure_modules_dir():
+    """
+    New world: modules live under ~/oled/modules/<module_id> with module.json + run.py
+    We only ensure the directory exists; we do NOT auto-generate legacy scripts.
+    """
+    MODULE_DIR.mkdir(parents=True, exist_ok=True)
+
+def discover_modules(modules_root: Path) -> List[Module]:
+    mods: List[Module] = []
     if not modules_root.exists():
         return mods
 
     for d in sorted(modules_root.iterdir()):
         if not d.is_dir():
             continue
+
         meta_path = d / "module.json"
         if not meta_path.exists():
             continue
 
         try:
             meta = json.loads(meta_path.read_text())
+
             if not meta.get("enabled", True):
                 continue
 
@@ -171,54 +190,19 @@ def discover_modules(modules_root: Path):
                 entry_path=str(entry_path),
                 order=int(meta.get("order", 999)),
             ))
-
         except Exception:
+            # Ignore bad module entries so one broken module doesn't kill the UI
             continue
 
     mods.sort(key=lambda m: (m.order, m.name.lower()))
     return mods
-
-
-@dataclass
-class Module:
-    id: str
-    name: str
-    subtitle: str
-    entry_path: str
-    order: int = 999
-
-
-MODULES = [
-   MODULES = discover_modules(MODULE_DIR)
-]
-
-def ensure_modules():
-    MODULE_DIR.mkdir(exist_ok=True)
-    status = MODULE_DIR / "status.py"
-    if not status.exists():
-        status.write_text(
-            "import time, subprocess\n"
-            "from luma.core.interface.serial import i2c\n"
-            "from luma.oled.device import ssd1306\n"
-            "from luma.core.render import canvas\n"
-            "device = ssd1306(i2c(1,0x3C),128,64)\n"
-            "def ip(): return subprocess.getoutput('hostname -I').split()[0]\n"
-            "while True:\n"
-            "  with canvas(device) as d:\n"
-            "    d.text((0,0),'STATUS',fill=255)\n"
-            "    d.line((0,12,127,12),fill=255)\n"
-            "    d.text((0,18),f'IP {ip()}',fill=255)\n"
-            "    d.text((0,32),time.strftime('%H:%M:%S'),fill=255)\n"
-            "    d.text((0,56),'BACK exits',fill=255)\n"
-            "  time.sleep(1)\n"
-        )
 
 # =====================================================
 # UI SCREENS
 # =====================================================
 def splash():
     start = time.time()
-    phase = 0
+    phase = 0.0
     while True:
         with canvas(device) as draw:
             draw.text((0, 2), "GHOST GEEKS", fill=255)
@@ -230,13 +214,28 @@ def splash():
             return
         time.sleep(SPLASH_FRAME_SLEEP)
 
-def draw_menu(idx):
+def draw_menu(mods: List[Module], idx: int):
     with canvas(device) as draw:
         draw.text((0, 0), "GHOST GEEKS MENU", fill=255)
         draw.line((0, 12, 127, 12), fill=255)
-        for i in range(len(MODULES)):
+
+        # Fit as many items as we can
+        max_rows = 4  # 16, 28, 40, 52 (but last row conflicts with footer; we use 3 + footer)
+        # We'll show up to 3 items plus footer to keep it clean
+        visible_rows = 3
+
+        start_i = 0
+        if len(mods) > visible_rows:
+            # scroll window so the selection stays visible
+            start_i = max(0, min(idx - 1, len(mods) - visible_rows))
+
+        for row in range(visible_rows):
+            i = start_i + row
+            if i >= len(mods):
+                break
             prefix = ">" if i == idx else " "
-            draw.text((0, 16 + i * 12), f"{prefix} {MODULES[i].name}", fill=255)
+            draw.text((0, 16 + row * 12), f"{prefix} {mods[i].name}"[:21], fill=255)
+
         draw.text((0, 56), "SEL run  HOLD=cfg", fill=255)
 
 # =====================================================
@@ -268,17 +267,21 @@ def poweroff():
 # =====================================================
 # MODULE RUNNER
 # =====================================================
-def run_module(mod, consume, clear):
+def run_module(mod: Module, consume, clear):
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = menu")
+
     proc = subprocess.Popen(
-            ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
-        )
+        ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
     while proc.poll() is None:
         if consume("back"):
             proc.terminate()
             break
         time.sleep(0.05)
+
     clear()
 
 # =====================================================
@@ -289,7 +292,7 @@ def settings(consume, clear):
     while True:
         oled_message(
             "SETTINGS",
-            [hostname(), f"IP {get_ip()}", f"UP {uptime_short()}"],
+            [hostname(), f"IP {get_ip()}", f"UPTIME {uptime_short()}"],
             "BACK = menu",
         )
         if consume("back"):
@@ -306,33 +309,41 @@ def main():
         while True:
             time.sleep(1)
 
-    ensure_modules()
+    ensure_modules_dir()
     consume, clear, buttons = init_buttons()
     btn_up, btn_down, btn_select, btn_back = buttons
 
-
     splash()
+
+    modules = discover_modules(MODULE_DIR)
+    if not modules:
+        oled_message("NO MODULES", ["Add modules under", "~/oled/modules", ""], "HOLD=cfg")
+        # Still allow settings and power holds
+        modules = [Module(id="none", name="(none)", subtitle="", entry_path="/bin/false", order=0)]
+
     idx = 0
-    draw_menu(idx)
+    draw_menu(modules, idx)
 
     back_pressed_at = None
 
     while True:
         if consume("up"):
-            idx = (idx - 1) % len(MODULES)
-            draw_menu(idx)
+            idx = (idx - 1) % len(modules)
+            draw_menu(modules, idx)
 
         if consume("down"):
-            idx = (idx + 1) % len(MODULES)
-            draw_menu(idx)
+            idx = (idx + 1) % len(modules)
+            draw_menu(modules, idx)
 
         if consume("select"):
-            run_module(MODULES[idx], consume, clear)
-            draw_menu(idx)
+            # ignore the dummy item
+            if modules[idx].id != "none":
+                run_module(modules[idx], consume, clear)
+            draw_menu(modules, idx)
 
         if consume("select_hold"):
             settings(consume, clear)
-            draw_menu(idx)
+            draw_menu(modules, idx)
 
         # BACK holds
         if btn_back.is_pressed:
