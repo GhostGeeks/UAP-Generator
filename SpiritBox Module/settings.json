@@ -1,0 +1,9 @@
+{
+  "band": "FM",
+  "fm_min": 76.0,
+  "fm_max": 108.0,
+  "step_mhz": 0.1,
+  "sweep_ms": 150,
+  "scan_style": "loop",
+  "mute_behavior": "none"
+}
