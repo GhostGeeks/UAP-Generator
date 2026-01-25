@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-import time, json
+import sys
+import time
+import json
+import select
 from pathlib import Path
-from gpiozero import Button
-from luma.oled.device import ssd1306
+
 from luma.core.interface.serial import i2c
+from luma.oled.device import ssd1306
 
-from oled.ui_common import render, draw_header, draw_row, draw_row_lr, draw_centered, LINE_H
-
+# Shared UI helpers (package import)
+from oled.ui_common import render, draw_header, draw_row, draw_row_lr, draw_centered
 
 # =====================
-# CONFIG
+# FILES / SETTINGS
 # =====================
-BTN_UP = 17
-BTN_DOWN = 27
-BTN_SELECT = 22
-BTN_BACK = 23
-
 HERE = Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "settings.json"
 
@@ -25,16 +23,15 @@ DEFAULT_SETTINGS = {
     "fm_max": 108.0,
     "step_mhz": 0.1,
     "sweep_ms": 150,
-    "scan_style": "LOOP",      # LOOP / BOUNCE / RANDOM (future)
-    "mute_behavior": "NONE"    # NONE (future expansion)
+    "scan_style": "LOOP",      # LOOP / BOUNCE / RANDOM
+    "mute_behavior": "NONE"    # future
 }
 
 # =====================
-# OLED
+# OLED INIT (correct luma API)
 # =====================
 serial = i2c(port=1, address=0x3C)
 device = ssd1306(serial, width=128, height=64)
-
 
 # =====================
 # SETTINGS
@@ -55,102 +52,73 @@ def save_settings(s):
     SETTINGS_FILE.write_text(json.dumps(s, indent=2))
 
 # =====================
-# BUTTON EVENTS (with SELECT tap vs hold)
+# BUTTON INPUT (from stdin)
 # =====================
-def init_buttons(hold_ms=550):
-    events = []
-    select_pressed_at = {"t": None}
-
-    def push(name):
-        events.append(name)
-
-    btn_up = Button(BTN_UP, pull_up=True, bounce_time=0.05)
-    btn_down = Button(BTN_DOWN, pull_up=True, bounce_time=0.05)
-    btn_back = Button(BTN_BACK, pull_up=True, bounce_time=0.05)
-    btn_sel = Button(BTN_SELECT, pull_up=True, bounce_time=0.03)
-
-    btn_up.when_pressed = lambda: push("up")
-    btn_down.when_pressed = lambda: push("down")
-    btn_back.when_pressed = lambda: push("back")
-
-    def sel_down():
-        select_pressed_at["t"] = time.time()
-
-    def sel_up():
-        t0 = select_pressed_at["t"]
-        select_pressed_at["t"] = None
-        if t0 is None:
-            return
-        dt = (time.time() - t0) * 1000
-        if dt >= hold_ms:
-            push("select_hold")
-        else:
-            push("select")
-
-    btn_sel.when_pressed = sel_down
-    btn_sel.when_released = sel_up
-
-    def consume():
-        if events:
-            return events.pop(0)
+def read_event():
+    """
+    Reads one event token from stdin, non-blocking.
+    Expected tokens: up, down, select, select_hold, back
+    app.py will send these lines when buttons pressed.
+    """
+    r, _, _ = select.select([sys.stdin], [], [], 0)
+    if not r:
         return None
-
-    return consume, (btn_up, btn_down, btn_sel, btn_back)
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return line.strip()
 
 # =====================
 # TEA5767 (stub for now)
 # =====================
 def tune(freq_mhz: float):
-    # TODO: implement TEA5767 I2C tune
-    # This module is scaffold-first; tuning comes next.
+    # TODO: implement TEA5767 tuning (next step)
     pass
 
 # =====================
-# UI: READY
+# UI SCREENS
 # =====================
-def ready_screen(settings, sel_idx):
+def screen_ready(settings, sel_idx):
     menu = ["START", "SETTINGS", "BACK"]
+
     def _draw(d):
         draw_header(d, "SPIRIT BOX")
         d.text((2, 20), f"FM {settings['fm_min']:.0f}-{settings['fm_max']:.0f} MHz", fill=255)
         d.text((2, 30), f"Rate: {int(settings['sweep_ms'])} ms", fill=255)
         y0 = 44
         for i, item in enumerate(menu):
-            draw_row(d, y0 + i*10, f"{item}", selected=(i == sel_idx))
+            draw_row(d, y0 + i * 10, item, selected=(i == sel_idx))
+
     return menu, _draw
 
-# =====================
-# UI: SETTINGS LIST (FM + Rate side-by-side)
-# =====================
-def settings_overview(settings, sel_idx):
+def screen_settings(settings, sel_idx):
     items = ["FM/RATE", "STEP", "SCAN", "BACK"]
 
     def _draw(d):
         draw_header(d, "SETTINGS")
-
-        # Row 0: FM band + sweep rate side-by-side
         fm_left = f"FM: {settings['fm_min']:.0f}-{settings['fm_max']:.0f}"
         rate_right = f"{int(settings['sweep_ms'])}ms"
         draw_row_lr(d, 20, fm_left, rate_right, selected=(sel_idx == 0), right_x=84)
-
-        # Row 1: Step
         draw_row(d, 30, f"Step: {settings['step_mhz']:.1f} MHz", selected=(sel_idx == 1))
-
-        # Row 2: Scan style
         draw_row(d, 40, f"Scan: {settings['scan_style']}", selected=(sel_idx == 2))
-
-        # Row 3: Back
         draw_row(d, 50, "Back", selected=(sel_idx == 3))
 
     return items, _draw
 
-# =====================
-# UI: EDIT MODES
-# =====================
-def edit_sweep_rate(settings, consume):
-    original = settings["sweep_ms"]
-    val = int(original)
+def screen_running(freq, settings):
+    def _draw(d):
+        draw_header(d, "FM SWEEP")
+        draw_centered(d, 26, f"{freq:.1f} MHz", invert=False)
+        d.text((2, 50), f"Rate: {int(settings['sweep_ms'])}ms", fill=255)
+        d.text((2, 60), "BACK stop  HOLD=Settings", fill=255)
+    return _draw
 
+# =====================
+# EDIT MODES
+# =====================
+def edit_sweep_rate(settings):
+    original = int(settings["sweep_ms"])
+    val = original
     MIN_MS, MAX_MS, STEP_MS = 50, 350, 50
 
     blink = False
@@ -166,11 +134,11 @@ def edit_sweep_rate(settings, consume):
             draw_header(d, "SWEEP RATE")
             draw_centered(d, 28, f"{val} ms", invert=blink)
             d.text((2, 52), "UP/DN adjust", fill=255)
-            d.text((2, 62-10), "SEL save  BACK cancel", fill=255)
+            d.text((2, 60), "SEL save  BACK cancel", fill=255)
 
         render(device, _draw)
 
-        ev = consume()
+        ev = read_event()
         if ev == "up":
             val = min(MAX_MS, val + STEP_MS)
         elif ev == "down":
@@ -184,8 +152,7 @@ def edit_sweep_rate(settings, consume):
 
         time.sleep(0.03)
 
-def edit_fm_band(settings, consume):
-    # Simple edit: choose among common bands (future: per-field editing)
+def edit_fm_band(settings):
     presets = [
         (76.0, 108.0, "76–108"),
         (87.5, 108.0, "87.5–108"),
@@ -201,12 +168,12 @@ def edit_fm_band(settings, consume):
             draw_header(d, "FM BAND")
             d.text((2, 24), "Choose range:", fill=255)
             for i, p in enumerate(presets):
-                draw_row(d, 34 + i*10, p[2], selected=(i == idx))
-            d.text((2, 62-10), "SEL save  BACK cancel", fill=255)
+                draw_row(d, 34 + i * 10, p[2], selected=(i == idx))
+            d.text((2, 60), "SEL save  BACK cancel", fill=255)
 
         render(device, _draw)
 
-        ev = consume()
+        ev = read_event()
         if ev == "up":
             idx = (idx - 1) % len(presets)
         elif ev == "down":
@@ -219,20 +186,21 @@ def edit_fm_band(settings, consume):
 
         time.sleep(0.03)
 
-def edit_scan_style(settings, consume):
+def edit_scan_style(settings):
     styles = ["LOOP", "BOUNCE", "RANDOM"]
-    idx = styles.index(settings.get("scan_style", "LOOP")) if settings.get("scan_style", "LOOP") in styles else 0
+    cur = settings.get("scan_style", "LOOP")
+    idx = styles.index(cur) if cur in styles else 0
 
     while True:
         def _draw(d):
             draw_header(d, "SCAN STYLE")
             for i, s in enumerate(styles):
-                draw_row(d, 24 + i*10, s, selected=(i == idx))
-            d.text((2, 62-10), "SEL save  BACK cancel", fill=255)
+                draw_row(d, 24 + i * 10, s, selected=(i == idx))
+            d.text((2, 60), "SEL save  BACK cancel", fill=255)
 
         render(device, _draw)
 
-        ev = consume()
+        ev = read_event()
         if ev == "up":
             idx = (idx - 1) % len(styles)
         elif ev == "down":
@@ -245,40 +213,84 @@ def edit_scan_style(settings, consume):
 
         time.sleep(0.03)
 
-# =====================
-# RUNNING: Sweep screen + hold-select to Settings
-# =====================
-def run_sweep(settings, consume):
-    freq = float(settings["fm_min"])
-    step = float(settings["step_mhz"])
-    delay = max(0.05, int(settings["sweep_ms"]) / 1000.0)
-
-    direction = 1  # for BOUNCE
+def fm_rate_submenu(settings):
+    opts = ["FM BAND", "SWEEP RATE", "BACK"]
+    sel = 0
 
     while True:
-        tune(freq)
-
         def _draw(d):
-            draw_header(d, "FM SWEEP")
-            # Big frequency presentation (centered)
-            draw_centered(d, 26, f"{freq:.1f} MHz", invert=False)
-            d.text((2, 50), f"Rate: {int(settings['sweep_ms'])}ms", fill=255)
-            d.text((2, 60), "BACK stop  HOLD=Settings", fill=255)
+            draw_header(d, "FM / RATE")
+            for i, o in enumerate(opts):
+                draw_row(d, 24 + i * 10, o, selected=(i == sel))
+            d.text((2, 60), "SEL choose  BACK return", fill=255)
 
         render(device, _draw)
 
-        ev = consume()
-        if ev == "back":
-            return  # stop sweep -> back to Ready
-        if ev == "select_hold":
-            # open settings while running (pause sweep visually)
-            settings = settings_flow(settings, consume)
-            save_settings(settings)
-            # update sweep timing if changed
-            delay = max(0.05, int(settings["sweep_ms"]) / 1000.0)
-            # continue sweeping from current freq
+        ev = read_event()
+        if ev == "up":
+            sel = (sel - 1) % len(opts)
+        elif ev == "down":
+            sel = (sel + 1) % len(opts)
+        elif ev == "back":
+            return settings
+        elif ev == "select":
+            if sel == 0:
+                settings, _ = edit_fm_band(settings)
+                save_settings(settings)
+            elif sel == 1:
+                settings, _ = edit_sweep_rate(settings)
+                save_settings(settings)
+            else:
+                return settings
 
-        # Advance frequency based on scan style
+        time.sleep(0.05)
+
+def settings_flow(settings):
+    sel = 0
+    while True:
+        items, draw_fn = screen_settings(settings, sel)
+        render(device, draw_fn)
+
+        ev = read_event()
+        if ev == "up":
+            sel = (sel - 1) % len(items)
+        elif ev == "down":
+            sel = (sel + 1) % len(items)
+        elif ev == "back":
+            return settings
+        elif ev == "select":
+            if sel == 0:
+                settings = fm_rate_submenu(settings)
+            elif sel == 1:
+                # Step size locked for now (0.1); future edit hook here
+                pass
+            elif sel == 2:
+                settings, _ = edit_scan_style(settings)
+                save_settings(settings)
+            elif sel == 3:
+                return settings
+
+        time.sleep(0.05)
+
+# =====================
+# RUN LOOP
+# =====================
+def run_sweep(settings):
+    freq = float(settings["fm_min"])
+    step = float(settings["step_mhz"])
+    direction = 1
+
+    while True:
+        tune(freq)
+        render(device, screen_running(freq, settings))
+
+        ev = read_event()
+        if ev == "back":
+            return settings
+        if ev == "select_hold":
+            settings = settings_flow(settings)
+            save_settings(settings)
+
         style = settings.get("scan_style", "LOOP")
         if style == "LOOP":
             freq += step
@@ -292,89 +304,25 @@ def run_sweep(settings, consume):
             elif freq <= settings["fm_min"]:
                 freq = settings["fm_min"]
                 direction = 1
-        else:  # RANDOM (simple)
-            # lightweight pseudo-random without imports
-            freq = settings["fm_min"] + ( (freq * 13.7) % (settings["fm_max"] - settings["fm_min"]) )
+        else:  # RANDOM lightweight
+            span = settings["fm_max"] - settings["fm_min"]
+            freq = settings["fm_min"] + ((freq * 13.7) % span)
 
+        delay = max(0.05, int(settings["sweep_ms"]) / 1000.0)
         time.sleep(delay)
-
-# =====================
-# SETTINGS FLOW
-# =====================
-def settings_flow(settings, consume):
-    sel = 0
-    while True:
-        items, draw_fn = settings_overview(settings, sel)
-        render(device, draw_fn)
-
-        ev = consume()
-        if ev == "up":
-            sel = (sel - 1) % len(items)
-        elif ev == "down":
-            sel = (sel + 1) % len(items)
-        elif ev == "back":
-            return settings
-        elif ev == "select":
-            if sel == 0:
-                # FM/RATE row: open a mini submenu
-                settings = fm_rate_submenu(settings, consume)
-                save_settings(settings)
-            elif sel == 1:
-                # step size is locked to 0.1 for now; keep placeholder for future
-                pass
-            elif sel == 2:
-                settings, _ = edit_scan_style(settings, consume)
-                save_settings(settings)
-            elif sel == 3:
-                return settings
-
-        time.sleep(0.05)
-
-def fm_rate_submenu(settings, consume):
-    # two options: edit band, edit rate
-    opts = ["FM BAND", "SWEEP RATE", "BACK"]
-    sel = 0
-    while True:
-        def _draw(d):
-            draw_header(d, "FM / RATE")
-            for i, o in enumerate(opts):
-                draw_row(d, 24 + i*10, o, selected=(i == sel))
-            d.text((2, 62-10), "SEL choose  BACK return", fill=255)
-
-        render(device, _draw)
-
-        ev = consume()
-        if ev == "up":
-            sel = (sel - 1) % len(opts)
-        elif ev == "down":
-            sel = (sel + 1) % len(opts)
-        elif ev == "back":
-            return settings
-        elif ev == "select":
-            if sel == 0:
-                settings, _ = edit_fm_band(settings, consume)
-            elif sel == 1:
-                settings, _ = edit_sweep_rate(settings, consume)
-            else:
-                return settings
-            save_settings(settings)
-
-        time.sleep(0.05)
 
 # =====================
 # MAIN
 # =====================
 def main():
     settings = load_settings()
-    consume, _btn_refs = init_buttons()
-
-    # READY screen selection
     sel = 0
+
     while True:
-        menu, draw_fn = ready_screen(settings, sel)
+        menu, draw_fn = screen_ready(settings, sel)
         render(device, draw_fn)
 
-        ev = consume()
+        ev = read_event()
         if ev == "up":
             sel = (sel - 1) % len(menu)
         elif ev == "down":
@@ -383,10 +331,10 @@ def main():
             return
         elif ev == "select":
             if menu[sel] == "START":
-                run_sweep(settings, consume)
-                settings = load_settings()  # refresh in case changed during run
+                settings = run_sweep(settings)
+                settings = load_settings()
             elif menu[sel] == "SETTINGS":
-                settings = settings_flow(settings, consume)
+                settings = settings_flow(settings)
                 save_settings(settings)
             else:
                 return
