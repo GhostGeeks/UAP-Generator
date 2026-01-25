@@ -1,0 +1,7 @@
+{
+  "id": "spirit_box",
+  "name": "Spirit Box",
+  "subtitle": "FM Sweep Scanner",
+  "order": 20,
+  "entry": "run.py"
+}
