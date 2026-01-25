@@ -6,9 +6,13 @@ import math
 import wave
 import random
 import signal
+import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
+
+# Non-blocking stdin
+import selectors
 
 from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
@@ -34,14 +38,19 @@ OUT_WAV = MOD_DIR / "uap3_output.wav"
 SAMPLE_RATE = 44100
 CHANNELS = 1
 
-# Output modes
+# Output modes (informational — routing is handled by OS default sink)
 MODE_LOCAL = "LOCAL"
 MODE_BT = "BT"
 MODE_AUTO = "AUTO"  # plays regardless; assumes system routes audio (BT if connected, else local)
 
 running = True
 
+
+# -----------------------------
+# OLED helpers
+# -----------------------------
 def oled_message(title: str, lines, footer: str = ""):
+    # OLED is 64px tall; last baseline around y=54 fits most fonts
     with canvas(device) as draw:
         draw.text((0, 0), title[:21], fill=255)
         draw.line((0, 12, 127, 12), fill=255)
@@ -52,9 +61,9 @@ def oled_message(title: str, lines, footer: str = ""):
         if footer:
             draw.text((0, 54), footer[:21], fill=255)
 
+
 def bt_connected() -> bool:
     """
-    More reliable than 'bluetoothctl info' with no device.
     Returns True if any connected device is listed.
     """
     try:
@@ -68,6 +77,10 @@ def bt_connected() -> bool:
     except Exception:
         return False
 
+
+# -----------------------------
+# Signal generator
+# -----------------------------
 def generate_uap_wav(path: Path, duration_s: int = 60):
     """
     Lightweight generator (no numpy/scipy). Creates a UAP-style layered signal.
@@ -80,7 +93,7 @@ def generate_uap_wav(path: Path, duration_s: int = 60):
         x = max(-1.0, min(1.0, x))
         return int(x * 32767)
 
-    # Layer params (inspired by your original generator description)
+    # Layer params
     schumann = 7.83
     carrier = 100.0
     harmonic = 528.0
@@ -97,9 +110,7 @@ def generate_uap_wav(path: Path, duration_s: int = 60):
     A_chirp = 0.08
     A_breath = 0.14
 
-    # helper for chirp
     def chirp(t_rel: float, dur: float) -> float:
-        # linear sweep instantaneous phase approximation
         k = (chirp_f1 - chirp_f0) / dur
         phase = 2 * math.pi * (chirp_f0 * t_rel + 0.5 * k * t_rel * t_rel)
         return math.sin(phase)
@@ -109,7 +120,6 @@ def generate_uap_wav(path: Path, duration_s: int = 60):
         wf.setsampwidth(2)  # 16-bit
         wf.setframerate(SAMPLE_RATE)
 
-        # write in chunks
         chunk = 1024
         n = 0
         while n < total_frames:
@@ -118,36 +128,41 @@ def generate_uap_wav(path: Path, duration_s: int = 60):
 
             for i in range(frames):
                 t = (n + i) / SAMPLE_RATE
-                # 1) Schumann AM over 100 Hz carrier
+
+                # 1) Schumann AM over carrier
                 mod = 0.5 * (1.0 + math.sin(2 * math.pi * schumann * t))
                 sch = math.sin(2 * math.pi * carrier * t) * mod * A_sch
 
-                # 2) 528 Hz + harmonics (slight wobble)
+                # 2) 528 Hz + harmonics
                 wobble = 1.0 + 0.001 * math.sin(2 * math.pi * 0.1 * t)
-                har = (math.sin(2 * math.pi * harmonic * t) +
-                       0.3 * math.sin(2 * math.pi * (harmonic * 2) * t) +
-                       0.1 * math.sin(2 * math.pi * (harmonic * 3) * t)) * wobble * A_har
+                har = (
+                    math.sin(2 * math.pi * harmonic * t)
+                    + 0.3 * math.sin(2 * math.pi * (harmonic * 2) * t)
+                    + 0.1 * math.sin(2 * math.pi * (harmonic * 3) * t)
+                ) * wobble * A_har
 
                 # 3) Ambient pad
-                amb = (math.sin(2 * math.pi * ambient * t) +
-                       0.5 * math.sin(2 * math.pi * (ambient * 1.5) * t + 0.3) +
-                       0.25 * math.sin(2 * math.pi * (ambient * 2.0) * t + 0.7)) * (0.8 + 0.2 * math.sin(2 * math.pi * 0.1 * t)) * A_amb
+                amb = (
+                    math.sin(2 * math.pi * ambient * t)
+                    + 0.5 * math.sin(2 * math.pi * (ambient * 1.5) * t + 0.3)
+                    + 0.25 * math.sin(2 * math.pi * (ambient * 2.0) * t + 0.7)
+                ) * (0.8 + 0.2 * math.sin(2 * math.pi * 0.1 * t)) * A_amb
 
-                # 4) Pings every 5 seconds, 100ms
+                # 4) Pings every 5s, 100ms
                 ping = 0.0
                 cycle5 = t % 5.0
                 if cycle5 < 0.10:
                     env = math.sin(math.pi * (cycle5 / 0.10)) ** 2
                     ping = math.sin(2 * math.pi * ping_freq * t) * env * A_ping
 
-                # 5) Chirps every 10 seconds, 200ms
+                # 5) Chirps every 10s, 200ms
                 chirp_sig = 0.0
                 cycle10 = t % 10.0
                 if cycle10 < 0.20:
                     env = math.sin(math.pi * (cycle10 / 0.20)) ** 2
                     chirp_sig = chirp(cycle10, 0.20) * env * A_chirp
 
-                # 6) “Breathing” noise (simple shaped noise)
+                # 6) “Breathing” noise
                 breath_cycle = 5.0
                 pos = t % breath_cycle
                 if pos < 2.0:
@@ -163,18 +178,53 @@ def generate_uap_wav(path: Path, duration_s: int = 60):
             wf.writeframes(buf)
             n += frames
 
+
+# -----------------------------
+# Playback helpers
+# -----------------------------
+def _pick_player() -> List[str]:
+    """
+    Prefer PipeWire-native pw-play, fallback to paplay, then aplay.
+    """
+    if shutil.which("pw-play"):
+        return ["pw-play", "-q"]
+    if shutil.which("paplay"):
+        return ["paplay", "--client-name=ghostgeeks-uap"]
+    return ["aplay", "-q"]
+
+
+PLAYER_BASE = _pick_player()
+
+
+def _wav_ready(path: Path) -> bool:
+    try:
+        if not path.exists():
+            return False
+        # > 44 bytes = has more than bare WAV header
+        return path.stat().st_size > 44
+    except Exception:
+        return False
+
+
 def start_playback(path: Path) -> Optional[subprocess.Popen]:
     """
-    Plays WAV via pw-play. We use signals for pause/resume (SIGSTOP/SIGCONT).
+    Start playback using the best available backend.
+    Returns a Popen handle or None on failure.
     """
+    if not _wav_ready(path):
+        return None
+
+    cmd = PLAYER_BASE + [str(path)]
     try:
         return subprocess.Popen(
-            ["pw-play", "-q", str(path)],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            close_fds=True,
         )
     except Exception:
         return None
+
 
 def stop_process(p: Optional[subprocess.Popen]):
     if not p:
@@ -182,11 +232,12 @@ def stop_process(p: Optional[subprocess.Popen]):
     try:
         if p.poll() is None:
             p.terminate()
-            time.sleep(0.3)
+            time.sleep(0.2)
         if p.poll() is None:
             p.kill()
     except Exception:
         pass
+
 
 def pause_process(p: Optional[subprocess.Popen]):
     if not p or p.poll() is not None:
@@ -196,6 +247,7 @@ def pause_process(p: Optional[subprocess.Popen]):
     except Exception:
         pass
 
+
 def resume_process(p: Optional[subprocess.Popen]):
     if not p or p.poll() is not None:
         return
@@ -204,93 +256,166 @@ def resume_process(p: Optional[subprocess.Popen]):
     except Exception:
         pass
 
+
+# -----------------------------
+# Signals
+# -----------------------------
 def handle_sigterm(sig, frame):
     global running
     running = False
 
+
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
+
+# -----------------------------
+# Input loop (non-blocking)
+# -----------------------------
+def _setup_stdin_selector():
+    sel = selectors.DefaultSelector()
+    try:
+        sel.register(sys.stdin, selectors.EVENT_READ)
+    except Exception:
+        return None
+    return sel
+
+
+def _read_command(sel) -> Optional[str]:
+    """
+    Non-blocking read of a single command line from stdin.
+    Returns lowercased command or None.
+    """
+    if sel is None:
+        # Fallback: tiny sleep and no command
+        time.sleep(0.05)
+        return None
+
+    events = sel.select(timeout=0.05)
+    if not events:
+        return None
+
+    try:
+        line = sys.stdin.readline()
+    except Exception:
+        return None
+
+    if not line:
+        return None
+
+    return line.strip().lower()
+
+
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     """
-    Controls:
-      - Receives commands from stdin (sent by app.py): up, down, select, select_hold, back
-      - select toggles play/pause
-      - up/down changes output mode
-      - back exits cleanly
+    Controls (stdin commands sent by app.py):
+      - up/down: change mode label
+      - select: play/pause toggle
+      - select_hold: regenerate a new wav
+      - back: exit
     """
-    mode_idx = 0
     modes = [MODE_AUTO, MODE_LOCAL, MODE_BT]
+    mode_idx = 0
 
     playing = False
     paused = False
-    proc = None
+    proc: Optional[subprocess.Popen] = None
 
     MOD_DIR.mkdir(parents=True, exist_ok=True)
 
     oled_message("UAP CALLER", ["Loading...", "", ""], "BACK = exit")
-    time.sleep(0.4)
+    time.sleep(0.3)
 
-    # Make/generate file if missing
+    # Generate file if missing
     if not OUT_WAV.exists():
         oled_message("UAP CALLER", ["Generating audio", "Please wait...", ""], "BACK = exit")
         generate_uap_wav(OUT_WAV, duration_s=60)
 
+    # Ensure it’s ready (race-proof)
+    t0 = time.time()
+    while not _wav_ready(OUT_WAV) and (time.time() - t0) < 5.0:
+        time.sleep(0.05)
+
     oled_message("UAP CALLER", [f"Mode: {modes[mode_idx]}", "SEL = play/pause", ""], "UP/DN mode")
 
-    # stdin command loop
+    sel = _setup_stdin_selector()
+
     global running
     while running:
-        # Read a line if available (non-blocking-ish)
-        line = sys.stdin.readline()
-        if not line:
-            time.sleep(0.05)
-            continue
+        cmd = _read_command(sel)
 
-        cmd = line.strip().lower()
+        if cmd is None:
+            # Update state if playback ended naturally
+            if playing and proc and proc.poll() is not None:
+                playing = False
+                paused = False
+                proc = None
+            continue
 
         if cmd == "up":
             mode_idx = (mode_idx - 1) % len(modes)
+
         elif cmd == "down":
             mode_idx = (mode_idx + 1) % len(modes)
+
         elif cmd == "select":
-            # Toggle play/pause
             if not playing:
-                # If BT mode requested but no BT connected, show warning (still can try)
+                # Informational warning only (routing handled by OS)
                 if modes[mode_idx] == MODE_BT and not bt_connected():
                     oled_message("UAP CALLER", ["No BT connected", "Playing anyway...", ""], "BACK = exit")
-                    time.sleep(0.8)
+                    time.sleep(0.6)
 
                 proc = start_playback(OUT_WAV)
-                playing = proc is not None
-                paused = False
-            else:
-                # playing -> pause/resume
-                if not paused:
-                    pause_process(proc)
-                    paused = True
+
+                if proc is None:
+                    oled_message("UAP CALLER", ["Playback failed", "Missing player?", str(OUT_WAV.name)], "BACK = exit")
+                    time.sleep(0.8)
+                    playing = False
+                    paused = False
                 else:
-                    resume_process(proc)
+                    playing = True
                     paused = False
 
+            else:
+                # Toggle pause/resume
+                if proc and proc.poll() is None:
+                    if not paused:
+                        pause_process(proc)
+                        paused = True
+                    else:
+                        resume_process(proc)
+                        paused = False
+                else:
+                    # Player already ended
+                    playing = False
+                    paused = False
+                    proc = None
+
         elif cmd == "select_hold":
-            # Optional: regenerate a new file quickly
             oled_message("UAP CALLER", ["Regenerating", "audio...", ""], "BACK = exit")
             stop_process(proc)
             proc = None
             playing = False
             paused = False
+
             generate_uap_wav(OUT_WAV, duration_s=60)
+
+            # Wait briefly until file is ready
+            t0 = time.time()
+            while not _wav_ready(OUT_WAV) and (time.time() - t0) < 5.0:
+                time.sleep(0.05)
 
         elif cmd == "back":
             break
 
-        # Update UI
+        # Update OLED
         status = "STOPPED"
         if playing and proc and proc.poll() is None:
             status = "PAUSED" if paused else "PLAYING"
         elif playing:
-            # playback ended
             playing = False
             paused = False
             proc = None
@@ -310,7 +435,8 @@ def main():
     # Cleanup
     stop_process(proc)
     oled_message("UAP CALLER", ["Exiting...", "", ""], "")
-    time.sleep(0.3)
+    time.sleep(0.2)
+
 
 if __name__ == "__main__":
     main()
