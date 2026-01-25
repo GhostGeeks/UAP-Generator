@@ -5,7 +5,8 @@ from gpiozero import Button
 from luma.oled.device import ssd1306
 from luma.core.interface.serial import i2c
 
-from ui_common import render, draw_header, draw_row, draw_row_lr, draw_centered, LINE_H
+from oled.ui_common import render, draw_header, draw_row, draw_row_lr, draw_centered, LINE_H
+
 
 # =====================
 # CONFIG
