@@ -441,8 +441,9 @@ def main():
 
     # Cleanup
     stop_process(proc)
-    oled_message("UAP CALLER", ["Exiting...", "", ""], "")
-    time.sleep(0.2)
+    oled_message("UAP CALLER", ["Returning to menu...", "", ""], "...")
+    time.sleep(0.6)
+
 
 
 if __name__ == "__main__":
