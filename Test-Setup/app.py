@@ -265,24 +265,60 @@ def poweroff():
     subprocess.Popen(["sudo", "-n", "systemctl", "poweroff"])
 
 # =====================================================
-# MODULE RUNNER
+# MODULE RUNNER (stdin-controlled)
 # =====================================================
 def run_module(mod: Module, consume, clear):
-    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = menu")
+    """
+    Run a module and forward button events to it via stdin.
+    This prevents GPIO "busy" errors because ONLY app.py owns GPIO.
+    """
+    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
     proc = subprocess.Popen(
         ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path],
+        stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
     )
 
-    while proc.poll() is None:
-        if consume("back"):
-            proc.terminate()
-            break
-        time.sleep(0.05)
+    def send(msg: str):
+        try:
+            if proc.stdin and proc.poll() is None:
+                proc.stdin.write(msg + "\n")
+                proc.stdin.flush()
+        except Exception:
+            pass
 
     clear()
+
+    while proc.poll() is None:
+        if consume("up"):
+            send("up")
+        if consume("down"):
+            send("down")
+        if consume("select"):
+            send("select")
+        if consume("select_hold"):
+            send("select_hold")
+
+        # BACK should request module exit, then fall back to terminate if needed
+        if consume("back"):
+            send("back")
+            # give it a moment to exit cleanly
+            for _ in range(30):  # ~1.5s
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if proc.poll() is None:
+                proc.terminate()
+            break
+
+        time.sleep(0.02)
+
+    clear()
+
 
 # =====================================================
 # SETTINGS
