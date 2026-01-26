@@ -1,8 +1,6 @@
-cat > ~/oled/modules/tone_generator/module.json <<'JSON'
 {
   "id": "tone_generator",
   "name": "Tone Generator",
   "subtitle": "steady / pulse / sweep",
   "order": 40
 }
-JSON
