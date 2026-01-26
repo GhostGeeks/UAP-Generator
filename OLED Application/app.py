@@ -1,4 +1,4 @@
-    #!/usr/bin/env python3
+        #!/usr/bin/env python3
 import os
 os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
 
@@ -335,11 +335,12 @@ def run_module(mod, consume, clear):
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
-            stdout=logf,
-            stderr=logf,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
         )
+
 
     except Exception as e:
         oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
