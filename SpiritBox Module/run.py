@@ -7,71 +7,47 @@ from pathlib import Path
 
 from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
+from luma.core.render import canvas
 
-# Shared UI helpers (already used in your other modules)
-from oled.ui_common import render, draw_row, draw_centered
+# ============================================================
+# OLED CONFIG
+# ============================================================
+I2C_PORT = 1
+I2C_ADDR = 0x3C
+OLED_W, OLED_H = 128, 64
 
-# =====================
-# PATHS / SETTINGS
-# =====================
+serial = i2c(port=I2C_PORT, address=I2C_ADDR)
+device = ssd1306(serial, width=OLED_W, height=OLED_H)
+
+# ============================================================
+# FILES
+# ============================================================
 HERE = Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "settings.json"
 
 DEFAULT_SETTINGS = {
-    "step_mhz": 0.1,
+    "step_mhz": 0.1,          # fixed by request; still stored for future
     "sweep_ms": 150,          # 50..350 step 50
     "scan_style": "LOOP",     # LOOP / BOUNCE / RANDOM
-    # FM band intentionally removed (fixed/implied)
-    # mute/filters intentionally omitted for now (future)
+    "volume": 80,             # 0..100 (global)
 }
 
-# =====================
-# OLED INIT
-# =====================
-serial = i2c(port=1, address=0x3C)
-device = ssd1306(serial, width=128, height=64)
-
-# =====================
-# UI CONSTANTS
-# =====================
+# ============================================================
+# UI LAYOUT (tuned to avoid footer clipping)
+# ============================================================
 HEADER_Y = 0
 DIVIDER_Y = 12
 
-LIST_Y0 = 16
-ROW_H = 10
+LIST_Y0 = 14        # content starts just under divider
+ROW_H = 10          # tight spacing to fit more items
 
-FOOTER_LINE_Y = 54
-FOOTER_Y = 56
+FOOTER_LINE_Y = 52  # lifted up
+FOOTER_Y = 54       # lifted up so text is fully visible
 
-def header(d, title: str):
-    d.text((2, HEADER_Y), title, fill=255)
-    d.line((0, DIVIDER_Y, 127, DIVIDER_Y), fill=255)
 
-def footer(d, text: str):
-    d.line((0, FOOTER_LINE_Y, 127, FOOTER_LINE_Y), fill=255)
-    d.text((2, FOOTER_Y), text, fill=255)
-
-# =====================
-# SETTINGS I/O
-# =====================
-def load_settings():
-    if SETTINGS_FILE.exists():
-        try:
-            s = json.loads(SETTINGS_FILE.read_text())
-            out = DEFAULT_SETTINGS.copy()
-            out.update(s)
-            return out
-        except Exception:
-            pass
-    SETTINGS_FILE.write_text(json.dumps(DEFAULT_SETTINGS, indent=2))
-    return DEFAULT_SETTINGS.copy()
-
-def save_settings(s):
-    SETTINGS_FILE.write_text(json.dumps(s, indent=2))
-
-# =====================
-# BUTTON INPUT (stdin from parent UI)
-# =====================
+# ============================================================
+# INPUT (stdin from parent app.py)
+# ============================================================
 def read_event():
     """
     Reads one event token from stdin, non-blocking.
@@ -88,95 +64,135 @@ def read_event():
         return None
     return line.strip()
 
-# =====================
-# TEA5767 RADIO CONTROL (STUB for now)
-# =====================
-def tune(_freq_mhz: float):
+
+# ============================================================
+# SETTINGS I/O
+# ============================================================
+def load_settings():
+    if SETTINGS_FILE.exists():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text())
+            out = DEFAULT_SETTINGS.copy()
+            out.update(data)
+            return out
+        except Exception:
+            pass
+    save_settings(DEFAULT_SETTINGS.copy())
+    return DEFAULT_SETTINGS.copy()
+
+
+def save_settings(s):
+    SETTINGS_FILE.write_text(json.dumps(s, indent=2))
+
+
+# ============================================================
+# UI DRAW HELPERS
+# ============================================================
+def draw_header(d, title: str):
+    d.text((2, HEADER_Y), title[:21], fill=255)
+    d.line((0, DIVIDER_Y, 127, DIVIDER_Y), fill=255)
+
+
+def draw_footer(d, text: str):
+    d.line((0, FOOTER_LINE_Y, 127, FOOTER_LINE_Y), fill=255)
+    d.text((2, FOOTER_Y), text[:21], fill=255)
+
+
+def draw_row(d, y: int, text: str, selected: bool = False):
+    # selection marker on left
+    marker = ">" if selected else " "
+    d.text((0, y), marker, fill=255)
+    d.text((10, y), text[:19], fill=255)
+
+
+def draw_centered_text(d, y: int, text: str):
+    # crude centering
+    x = max(0, (OLED_W - (len(text) * 6)) // 2)
+    d.text((x, y), text, fill=255)
+
+
+def render(draw_fn):
+    with canvas(device) as d:
+        draw_fn(d)
+
+
+# ============================================================
+# RADIO CONTROL (STUB for now)
+# ============================================================
+def radio_tune(_freq_mhz: float):
     """
-    TODO: Implement TEA5767 tuning over I2C.
-    For now, it's a stub so UI + flow works while hardware arrives.
+    TODO: Implement TEA5767 tune over I2C.
+    Keeping this stub so UI works now.
     """
     return
 
-# =====================
-# SCREENS
-# =====================
-def screen_menu(settings, sel):
-    items = ["START", "SETTINGS"]  # BACK is hardware-only
+
+# ============================================================
+# SCREEN: MAIN MENU
+# ============================================================
+def menu_screen(settings, sel_idx: int):
+    items = ["START", "SETTINGS"]
 
     def _draw(d):
-        header(d, "SPIRIT BOX")
+        draw_header(d, "SPIRIT BOX")
 
-        # Compact status line (no FM band info shown)
-        d.text((2, LIST_Y0), f"Rate {int(settings['sweep_ms'])}ms  {settings['scan_style']}", fill=255)
+        # clean content block
+        draw_row(d, LIST_Y0 + 0 * ROW_H, items[0], selected=(sel_idx == 0))
+        draw_row(d, LIST_Y0 + 1 * ROW_H, items[1], selected=(sel_idx == 1))
 
-        menu_y = LIST_Y0 + ROW_H + 2
-        draw_row(d, menu_y + 0 * ROW_H, items[0], selected=(sel == 0))
-        draw_row(d, menu_y + 1 * ROW_H, items[1], selected=(sel == 1))
-
-        footer(d, "SEL choose   BACK exit")
+        # footer
+        draw_footer(d, "SEL choose  BACK exit")
 
     return items, _draw
 
-def screen_settings(settings, sel_idx):
-    # Each editable item on its own line
-    items = ["Sweep Rate", "Step", "Scan Style"]
+
+# ============================================================
+# SCREEN: SETTINGS
+# ============================================================
+def settings_screen(settings, sel_idx: int):
+    """
+    Per request:
+      - each editable item on its own line
+      - no FM band shown
+      - no 'Back' as a menu item
+    """
+    rate = int(settings.get("sweep_ms", 150))
+    style = settings.get("scan_style", "LOOP")
+    vol = int(settings.get("volume", 80))
+
+    lines = [
+        f"Sweep: {rate}ms",
+        f"Style: {style}",
+        f"Vol:   {vol}%",
+    ]
 
     def _draw(d):
-        header(d, "SETTINGS")
+        draw_header(d, "SETTINGS")
 
-        draw_row(d, LIST_Y0 + 0 * ROW_H,
-                 f"Rate: {int(settings['sweep_ms'])}ms",
-                 selected=(sel_idx == 0))
-        draw_row(d, LIST_Y0 + 1 * ROW_H,
-                 f"Step: {settings['step_mhz']:.1f}MHz",
-                 selected=(sel_idx == 1))
-        draw_row(d, LIST_Y0 + 2 * ROW_H,
-                 f"Scan: {settings['scan_style']}",
-                 selected=(sel_idx == 2))
+        # visible rows = 3 (fits perfectly with footer lifted)
+        for i, line in enumerate(lines):
+            draw_row(d, LIST_Y0 + i * ROW_H, line, selected=(sel_idx == i))
 
-        footer(d, "SEL edit   BACK menu")
+        draw_footer(d, "SEL edit  BACK menu")
 
-    return items, _draw
+    return lines, _draw
 
-def screen_running(freq, settings):
-    def _draw(d):
-        header(d, "FM SWEEP")
 
-        # Tight layout, footer always visible
-        draw_centered(d, 22, f"{freq:.1f} MHz", invert=False)
-        d.text((2, 38), f"Rate: {int(settings['sweep_ms'])}ms", fill=255)
-        d.text((2, 48), f"Scan: {settings['scan_style']}", fill=255)
-
-        footer(d, "BACK stop  HOLD settings")
-
-    return _draw
-
-# =====================
+# ============================================================
 # EDITORS
-# =====================
+# ============================================================
 def edit_sweep_rate(settings):
-    original = int(settings["sweep_ms"])
-    val = original
-
+    val = int(settings.get("sweep_ms", 150))
     MIN_MS, MAX_MS, STEP_MS = 50, 350, 50
 
-    blink = False
-    last_blink = time.time()
-
     while True:
-        now = time.time()
-        if now - last_blink > 0.35:
-            blink = not blink
-            last_blink = now
-
         def _draw(d):
-            header(d, "SWEEP RATE")
-            draw_centered(d, 26, f"{val} ms", invert=blink)
+            draw_header(d, "SWEEP RATE")
+            draw_centered_text(d, 26, f"{val} ms")
             d.text((2, 40), "UP/DN adjust", fill=255)
-            footer(d, "SEL save  BACK cancel")
+            draw_footer(d, "SEL save BACK cancel")
 
-        render(device, _draw)
+        render(_draw)
 
         ev = read_event()
         if ev == "up":
@@ -185,105 +201,144 @@ def edit_sweep_rate(settings):
             val = max(MIN_MS, val - STEP_MS)
         elif ev == "select":
             settings["sweep_ms"] = val
-            return settings, True
+            save_settings(settings)
+            return
         elif ev == "back":
-            settings["sweep_ms"] = original
-            return settings, False
+            return
 
         time.sleep(0.03)
 
+
 def edit_scan_style(settings):
-    styles = ["LOOP", "BOUNCE", "RANDOM"]
+    options = ["LOOP", "BOUNCE", "RANDOM"]
     cur = settings.get("scan_style", "LOOP")
-    idx = styles.index(cur) if cur in styles else 0
+    idx = options.index(cur) if cur in options else 0
 
     while True:
         def _draw(d):
-            header(d, "SCAN STYLE")
-            for i, s in enumerate(styles):
-                draw_row(d, LIST_Y0 + i * ROW_H, s, selected=(i == idx))
-            footer(d, "SEL save  BACK cancel")
+            draw_header(d, "SCAN STYLE")
+            for i, opt in enumerate(options):
+                draw_row(d, LIST_Y0 + i * ROW_H, opt, selected=(i == idx))
+            draw_footer(d, "SEL save BACK cancel")
 
-        render(device, _draw)
+        render(_draw)
 
         ev = read_event()
         if ev == "up":
-            idx = (idx - 1) % len(styles)
+            idx = (idx - 1) % len(options)
         elif ev == "down":
-            idx = (idx + 1) % len(styles)
+            idx = (idx + 1) % len(options)
         elif ev == "select":
-            settings["scan_style"] = styles[idx]
-            return settings, True
+            settings["scan_style"] = options[idx]
+            save_settings(settings)
+            return
         elif ev == "back":
-            return settings, False
+            return
 
         time.sleep(0.03)
 
-# =====================
-# FLOWS
-# =====================
-def settings_flow(settings, return_to="MENU"):
-    """
-    return_to:
-      - "MENU": BACK returns to menu
-      - "SWEEP": BACK returns to sweep (when opened from hold)
-    """
-    sel = 0
+
+def edit_volume(settings):
+    val = int(settings.get("volume", 80))
+    val = max(0, min(100, val))
 
     while True:
-        items, draw_fn = screen_settings(settings, sel)
-        if sel < 0 or sel >= len(items):
-            sel = 0
+        def _draw(d):
+            draw_header(d, "VOLUME")
+            draw_centered_text(d, 26, f"{val}%")
+            d.text((2, 40), "UP/DN adjust", fill=255)
+            draw_footer(d, "SEL save BACK cancel")
 
-        render(device, draw_fn)
+        render(_draw)
 
         ev = read_event()
         if ev == "up":
-            sel = (sel - 1) % len(items)
+            val = min(100, val + 5)
         elif ev == "down":
-            sel = (sel + 1) % len(items)
+            val = max(0, val - 5)
+        elif ev == "select":
+            settings["volume"] = val
+            save_settings(settings)
+            return
         elif ev == "back":
-            return settings, return_to
+            return
+
+        time.sleep(0.03)
+
+
+# ============================================================
+# SCREEN: FM SWEEP (freq only)
+# ============================================================
+def sweep_screen(freq_mhz: float):
+    def _draw(d):
+        draw_header(d, "FM SWEEP")
+
+        # freq only, big and centered
+        draw_centered_text(d, 26, f"{freq_mhz:.1f} MHz")
+
+        # no sweep rate / style displayed (per request)
+        draw_footer(d, "BACK stop  HOLD settings")
+
+    return _draw
+
+
+# ============================================================
+# FLOW: SETTINGS
+# ============================================================
+def settings_flow(settings):
+    sel = 0
+    while True:
+        lines, draw_fn = settings_screen(settings, sel)
+        render(draw_fn)
+
+        ev = read_event()
+        if ev == "up":
+            sel = (sel - 1) % len(lines)
+        elif ev == "down":
+            sel = (sel + 1) % len(lines)
+        elif ev == "back":
+            # BACK returns to Spirit Box menu (not exiting module)
+            return "MENU"
         elif ev == "select":
             if sel == 0:
-                settings, changed = edit_sweep_rate(settings)
-                if changed:
-                    save_settings(settings)
+                edit_sweep_rate(settings)
             elif sel == 1:
-                # Step fixed for now (0.1). Hook for future editor lives here.
-                pass
+                edit_scan_style(settings)
             elif sel == 2:
-                settings, changed = edit_scan_style(settings)
-                if changed:
-                    save_settings(settings)
+                edit_volume(settings)
 
         time.sleep(0.05)
 
-def run_sweep(settings):
-    # FM range implied; pick a reasonable working range until your TEA5767 code lands.
-    # If you want a different fixed range, set these constants:
-    FMIN = 76.0
-    FMAX = 108.0
+
+# ============================================================
+# FLOW: SWEEP
+# ============================================================
+def sweep_flow(settings):
+    # fixed full range as requested
+    FMIN, FMAX = 76.0, 108.0
+    step = float(settings.get("step_mhz", 0.1))
 
     freq = FMIN
-    step = float(settings["step_mhz"])
     direction = 1
 
     while True:
-        tune(freq)
-        render(device, screen_running(freq, settings))
+        radio_tune(freq)
+        render(sweep_screen(freq))
 
         ev = read_event()
         if ev == "back":
-            # Stop sweep and return to Spirit Box menu (do NOT exit module)
-            return settings, "MENU"
+            # BACK returns to Spirit Box menu (not exiting module)
+            return "MENU"
         if ev == "select_hold":
-            # Open settings, then return to sweep after closing
-            settings, _ = settings_flow(settings, return_to="SWEEP")
-            save_settings(settings)
+            # quick access to settings; return back to sweep after
+            next_state = settings_flow(settings)
+            if next_state == "MENU":
+                # user backed out of settings -> go back to sweep
+                pass
 
         style = settings.get("scan_style", "LOOP")
 
+        # advance
         if style == "LOOP":
             freq += step
             if freq > FMAX:
@@ -298,54 +353,51 @@ def run_sweep(settings):
                 freq = FMIN
                 direction = 1
 
-        else:  # RANDOM (deterministic hop w/o importing random)
+        else:  # RANDOM
             span = max(0.1, (FMAX - FMIN))
+            # deterministic pseudo-random hop (no imports)
             freq = FMIN + ((freq * 13.7 + 1.3) % span)
 
-        delay = max(0.05, int(settings["sweep_ms"]) / 1000.0)
+        delay = max(0.05, int(settings.get("sweep_ms", 150)) / 1000.0)
         time.sleep(delay)
 
-# =====================
-# MAIN STATE MACHINE
-# =====================
+
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     settings = load_settings()
+
     state = "MENU"
-    sel = 0
+    menu_sel = 0
 
     while True:
         if state == "MENU":
-            menu, draw_fn = screen_menu(settings, sel)
-            render(device, draw_fn)
+            items, draw_fn = menu_screen(settings, menu_sel)
+            render(draw_fn)
 
             ev = read_event()
             if ev == "up":
-                sel = (sel - 1) % len(menu)
+                menu_sel = (menu_sel - 1) % len(items)
             elif ev == "down":
-                sel = (sel + 1) % len(menu)
-            elif ev == "back":
-                # BACK from menu exits module (returns to module selector)
-                return
+                menu_sel = (menu_sel + 1) % len(items)
             elif ev == "select":
-                if menu[sel] == "START":
-                    state = "SWEEP"
-                else:
-                    state = "SETTINGS"
+                state = "SWEEP" if menu_sel == 0 else "SETTINGS"
+            elif ev == "back":
+                # BACK from initial Spirit Box menu exits module
+                return
 
             time.sleep(0.05)
 
         elif state == "SETTINGS":
-            settings, next_state = settings_flow(settings, return_to="MENU")
-            save_settings(settings)
-            state = next_state
+            state = settings_flow(settings)
 
         elif state == "SWEEP":
-            settings, next_state = run_sweep(settings)
-            save_settings(settings)
-            state = next_state
+            state = sweep_flow(settings)
 
         else:
             state = "MENU"
+
 
 if __name__ == "__main__":
     main()
