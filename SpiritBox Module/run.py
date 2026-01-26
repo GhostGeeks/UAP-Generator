@@ -8,23 +8,21 @@ from pathlib import Path
 from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
 
-# Shared UI helpers
+# Shared UI helpers (already used in your other modules)
 from oled.ui_common import render, draw_row, draw_centered
 
 # =====================
-# FILES / SETTINGS
+# PATHS / SETTINGS
 # =====================
 HERE = Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "settings.json"
 
 DEFAULT_SETTINGS = {
-    "band": "FM",
-    "fm_min": 76.0,
-    "fm_max": 108.0,
     "step_mhz": 0.1,
     "sweep_ms": 150,          # 50..350 step 50
     "scan_style": "LOOP",     # LOOP / BOUNCE / RANDOM
-    "mute_behavior": "NONE",  # future
+    # FM band intentionally removed (fixed/implied)
+    # mute/filters intentionally omitted for now (future)
 }
 
 # =====================
@@ -38,8 +36,10 @@ device = ssd1306(serial, width=128, height=64)
 # =====================
 HEADER_Y = 0
 DIVIDER_Y = 12
+
 LIST_Y0 = 16
 ROW_H = 10
+
 FOOTER_LINE_Y = 54
 FOOTER_Y = 56
 
@@ -52,7 +52,7 @@ def footer(d, text: str):
     d.text((2, FOOTER_Y), text, fill=255)
 
 # =====================
-# SETTINGS IO
+# SETTINGS I/O
 # =====================
 def load_settings():
     if SETTINGS_FILE.exists():
@@ -89,27 +89,28 @@ def read_event():
     return line.strip()
 
 # =====================
-# TEA5767 (stub for now)
+# TEA5767 RADIO CONTROL (STUB for now)
 # =====================
 def tune(_freq_mhz: float):
-    # TODO: implement TEA5767 tuning
+    """
+    TODO: Implement TEA5767 tuning over I2C.
+    For now, it's a stub so UI + flow works while hardware arrives.
+    """
     return
 
 # =====================
 # SCREENS
 # =====================
 def screen_menu(settings, sel):
-    items = ["START", "SETTINGS"]  # no BACK as a selectable item
+    items = ["START", "SETTINGS"]  # BACK is hardware-only
 
     def _draw(d):
         header(d, "SPIRIT BOX")
 
-        # compact status block (readable, not “extra screen”)
-        d.text((2, LIST_Y0), f"FM {settings['fm_min']:.0f}-{settings['fm_max']:.0f} MHz", fill=255)
-        d.text((2, LIST_Y0 + ROW_H), f"Rate {int(settings['sweep_ms'])}ms  {settings['scan_style']}", fill=255)
+        # Compact status line (no FM band info shown)
+        d.text((2, LIST_Y0), f"Rate {int(settings['sweep_ms'])}ms  {settings['scan_style']}", fill=255)
 
-        # menu rows start lower
-        menu_y = LIST_Y0 + 2 * ROW_H + 2
+        menu_y = LIST_Y0 + ROW_H + 2
         draw_row(d, menu_y + 0 * ROW_H, items[0], selected=(sel == 0))
         draw_row(d, menu_y + 1 * ROW_H, items[1], selected=(sel == 1))
 
@@ -117,25 +118,22 @@ def screen_menu(settings, sel):
 
     return items, _draw
 
-def screen_settings(settings, sel):
+def screen_settings(settings, sel_idx):
     # Each editable item on its own line
-    items = ["FM Band", "Sweep Rate", "Step", "Scan Style"]
+    items = ["Sweep Rate", "Step", "Scan Style"]
 
     def _draw(d):
         header(d, "SETTINGS")
 
         draw_row(d, LIST_Y0 + 0 * ROW_H,
-                 f"FM Band: {settings['fm_min']:.0f}-{settings['fm_max']:.0f}",
-                 selected=(sel == 0))
-        draw_row(d, LIST_Y0 + 1 * ROW_H,
                  f"Rate: {int(settings['sweep_ms'])}ms",
-                 selected=(sel == 1))
-        draw_row(d, LIST_Y0 + 2 * ROW_H,
+                 selected=(sel_idx == 0))
+        draw_row(d, LIST_Y0 + 1 * ROW_H,
                  f"Step: {settings['step_mhz']:.1f}MHz",
-                 selected=(sel == 2))
-        draw_row(d, LIST_Y0 + 3 * ROW_H,
+                 selected=(sel_idx == 1))
+        draw_row(d, LIST_Y0 + 2 * ROW_H,
                  f"Scan: {settings['scan_style']}",
-                 selected=(sel == 3))
+                 selected=(sel_idx == 2))
 
         footer(d, "SEL edit   BACK menu")
 
@@ -145,10 +143,10 @@ def screen_running(freq, settings):
     def _draw(d):
         header(d, "FM SWEEP")
 
-        # tighter layout so footer is always visible
+        # Tight layout, footer always visible
         draw_centered(d, 22, f"{freq:.1f} MHz", invert=False)
-        d.text((2, 36), f"Rate: {int(settings['sweep_ms'])}ms", fill=255)
-        d.text((2, 46), f"Scan: {settings['scan_style']}", fill=255)
+        d.text((2, 38), f"Rate: {int(settings['sweep_ms'])}ms", fill=255)
+        d.text((2, 48), f"Scan: {settings['scan_style']}", fill=255)
 
         footer(d, "BACK stop  HOLD settings")
 
@@ -160,6 +158,7 @@ def screen_running(freq, settings):
 def edit_sweep_rate(settings):
     original = int(settings["sweep_ms"])
     val = original
+
     MIN_MS, MAX_MS, STEP_MS = 50, 350, 50
 
     blink = False
@@ -189,43 +188,6 @@ def edit_sweep_rate(settings):
             return settings, True
         elif ev == "back":
             settings["sweep_ms"] = original
-            return settings, False
-
-        time.sleep(0.03)
-
-def edit_fm_band(settings):
-    presets = [
-        (76.0, 108.0, "76–108"),
-        (87.5, 108.0, "87.5–108"),
-    ]
-    cur = (settings["fm_min"], settings["fm_max"])
-    idx = 0
-    for i, p in enumerate(presets):
-        if (p[0], p[1]) == cur:
-            idx = i
-            break
-
-    while True:
-        def _draw(d):
-            header(d, "FM BAND")
-            d.text((2, LIST_Y0), "Choose range:", fill=255)
-
-            for i, p in enumerate(presets):
-                draw_row(d, LIST_Y0 + ROW_H + i * ROW_H, p[2], selected=(i == idx))
-
-            footer(d, "SEL save  BACK cancel")
-
-        render(device, _draw)
-
-        ev = read_event()
-        if ev == "up":
-            idx = (idx - 1) % len(presets)
-        elif ev == "down":
-            idx = (idx + 1) % len(presets)
-        elif ev == "select":
-            settings["fm_min"], settings["fm_max"] = presets[idx][0], presets[idx][1]
-            return settings, True
-        elif ev == "back":
             return settings, False
 
         time.sleep(0.03)
@@ -264,7 +226,7 @@ def settings_flow(settings, return_to="MENU"):
     """
     return_to:
       - "MENU": BACK returns to menu
-      - "SWEEP": BACK returns to sweep (used when opened from hold)
+      - "SWEEP": BACK returns to sweep (when opened from hold)
     """
     sel = 0
 
@@ -284,17 +246,13 @@ def settings_flow(settings, return_to="MENU"):
             return settings, return_to
         elif ev == "select":
             if sel == 0:
-                settings, changed = edit_fm_band(settings)
-                if changed:
-                    save_settings(settings)
-            elif sel == 1:
                 settings, changed = edit_sweep_rate(settings)
                 if changed:
                     save_settings(settings)
-            elif sel == 2:
-                # step is fixed at 0.1 for now (future: add editor)
+            elif sel == 1:
+                # Step fixed for now (0.1). Hook for future editor lives here.
                 pass
-            elif sel == 3:
+            elif sel == 2:
                 settings, changed = edit_scan_style(settings)
                 if changed:
                     save_settings(settings)
@@ -302,7 +260,12 @@ def settings_flow(settings, return_to="MENU"):
         time.sleep(0.05)
 
 def run_sweep(settings):
-    freq = float(settings["fm_min"])
+    # FM range implied; pick a reasonable working range until your TEA5767 code lands.
+    # If you want a different fixed range, set these constants:
+    FMIN = 76.0
+    FMAX = 108.0
+
+    freq = FMIN
     step = float(settings["step_mhz"])
     direction = 1
 
@@ -315,31 +278,29 @@ def run_sweep(settings):
             # Stop sweep and return to Spirit Box menu (do NOT exit module)
             return settings, "MENU"
         if ev == "select_hold":
-            # Open settings, then return back to sweep after closing
+            # Open settings, then return to sweep after closing
             settings, _ = settings_flow(settings, return_to="SWEEP")
             save_settings(settings)
 
-        # advance frequency based on scan style
         style = settings.get("scan_style", "LOOP")
-        fmin = float(settings["fm_min"])
-        fmax = float(settings["fm_max"])
 
         if style == "LOOP":
             freq += step
-            if freq > fmax:
-                freq = fmin
+            if freq > FMAX:
+                freq = FMIN
+
         elif style == "BOUNCE":
             freq += step * direction
-            if freq >= fmax:
-                freq = fmax
+            if freq >= FMAX:
+                freq = FMAX
                 direction = -1
-            elif freq <= fmin:
-                freq = fmin
+            elif freq <= FMIN:
+                freq = FMIN
                 direction = 1
-        else:  # RANDOM
-            span = max(0.1, (fmax - fmin))
-            # deterministic-ish hop without importing random
-            freq = fmin + ((freq * 13.7 + 1.3) % span)
+
+        else:  # RANDOM (deterministic hop w/o importing random)
+            span = max(0.1, (FMAX - FMIN))
+            freq = FMIN + ((freq * 13.7 + 1.3) % span)
 
         delay = max(0.05, int(settings["sweep_ms"]) / 1000.0)
         time.sleep(delay)
@@ -370,7 +331,6 @@ def main():
                     state = "SWEEP"
                 else:
                     state = "SETTINGS"
-                    sel = 0
 
             time.sleep(0.05)
 
