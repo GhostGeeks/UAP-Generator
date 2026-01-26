@@ -429,8 +429,14 @@ def main():
 
         if consume("select"):
             if modules[idx].id != "none":
-                run_module(modules[idx], consume, clear)
-            draw_menu(modules, idx)
+                run_module(
+                    modules[idx],
+                    consume,
+                    clear,
+                    redraw_menu=lambda: draw_menu(modules, idx)
+)
+# draw_menu is already called by redraw_menu; no need to call again here
+
 
         if consume("select_hold"):
             settings_screen(consume, clear)
