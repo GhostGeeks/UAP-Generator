@@ -320,36 +320,94 @@ def settings(consume, clear):
 # MODULE RUNNER (critical: wake OLED after child exits)
 # =====================================================
 
-def run_module(mod: Module, consume, clear):
+def run_module(mod, consume, clear):
+    """
+    Runs a module as a child process and forwards button events to it via stdin.
+
+    Expected stdin commands in the module:
+      up, down, select, select_hold, back
+    """
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
-    proc = subprocess.Popen(
-        ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    cmd = ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
 
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
+        time.sleep(1.2)
+        clear()
+        oled_hard_wake()
+        return
+
+    def send(cmd_text: str):
+        try:
+            if proc.poll() is None and proc.stdin:
+                proc.stdin.write(cmd_text + "\n")
+                proc.stdin.flush()
+        except Exception:
+            pass  # module exited / stdin closed
+
+    # Main loop while module runs
     while proc.poll() is None:
+        if consume("up"):
+            send("up")
+        if consume("down"):
+            send("down")
+        if consume("select"):
+            send("select")
+        if consume("select_hold"):
+            send("select_hold")
+
         if consume("back"):
-            proc.terminate()
-            break
-        time.sleep(0.05)
+            # Tell module to go "back". Module should exit when appropriate.
+            send("back")
 
-    # Let the child exit fully
-    for _ in range(40):
-        if proc.poll() is not None:
-            break
-        time.sleep(0.01)
+            # Give it a moment to exit cleanly
+            for _ in range(30):
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.02)
 
-    # ---- KEY FIX: flush any lingering button events / bounce ----
+            # If it didn't exit, terminate it (safety)
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            break
+
+        time.sleep(0.02)
+
+    # Cleanup process handles
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except Exception:
+        pass
+
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    # ---- IMPORTANT: clear & drain lingering button events so menu doesn't "ghost back" ----
     clear()
     time.sleep(0.08)
     clear()
 
-    # Drain any queued events for a short window (prevents "ghost back")
     drain_until = time.time() + 0.20
     while time.time() < drain_until:
-        # consume clears flags if they were set by gpiozero callbacks
         consume("up")
         consume("down")
         consume("select")
@@ -357,8 +415,9 @@ def run_module(mod: Module, consume, clear):
         consume("back")
         time.sleep(0.01)
 
-    # Wake OLED in case module turned it off / left bus weird
+    # ---- IMPORTANT: re-init OLED in case module left it off/blank ----
     oled_hard_wake()
+
 
 # =====================================================
 # MAIN
