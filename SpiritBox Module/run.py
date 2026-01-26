@@ -385,7 +385,14 @@ def main():
                 state = "SWEEP" if menu_sel == 0 else "SETTINGS"
             elif ev == "back":
                 # BACK from initial Spirit Box menu exits module
+                def _draw(d):
+                    draw_header(d, "SPIRIT BOX")
+                    draw_centered_text(d, 28, "Returning...")
+                    draw_footer(d, " ")
+                render(_draw)
+                time.sleep(0.2)
                 return
+
 
             time.sleep(0.05)
 
