@@ -151,7 +151,8 @@ class Module:
     subtitle: str
     entry_path: str
     order: int = 999
-
+    back_armed_until = 0.0 
+    
 def ensure_modules_dir():
     """
     New world: modules live under ~/oled/modules/<module_id> with module.json + run.py
