@@ -332,9 +332,6 @@ def run_module(mod, consume, clear):
     cmd = ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
 
     try:
-       log_path = "/home/ghostgeeks01/oled/module_last.log"
-        logf = open(log_path, "w")
-
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
