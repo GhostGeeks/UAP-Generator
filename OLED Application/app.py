@@ -321,79 +321,102 @@ def settings(consume, clear):
 # =====================================================
 def run_module(mod, consume, clear):
     """
-    Run a module as a child process and forward button events to it via stdin.
+    Runs a module as a child process and forwards button events to it via stdin.
 
-    Expected stdin commands in the module (one per line):
+    Expected stdin commands in the module:
       up, down, select, select_hold, back
 
-    Behavior:
-      - BACK in the parent requests module exit (sends "back"),
-        then terminates if it doesn't quit quickly.
-      - On return, drains queued events so the menu doesn't "catch up"
-        and forces an OLED wake/redraw.
-      - Logs module stdout/stderr to: ~/oled/logs/<module_id>.log
+    Key improvements:
+      - Uses module directory as cwd (fixes modules that rely on relative paths)
+      - Logs stdout+stderr to /home/ghostgeeks01/oled/logs/<module>_YYYYmmdd_HHMMSS.log
+      - Doesn't blank the OLED on return (only clears button events)
+      - Attempts graceful exit on BACK, then terminate/kill if needed
     """
-    from pathlib import Path
+    import os
     import subprocess
     import time
+    from pathlib import Path
+    from datetime import datetime
 
-    # Show launch screen
-    oled_message("RUNNING", [mod.name, getattr(mod, "subtitle", "")], "BACK = exit")
+    # Show a quick "running" screen (optional)
+    try:
+        oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
+    except Exception:
+        pass
 
-    # Clear any pending events before launch (prevents immediate exit)
-    clear()
-    for _ in range(8):
-        consume("up"); consume("down"); consume("select"); consume("select_hold"); consume("back")
-        time.sleep(0.005)
-
-    # Build command
-    entry = getattr(mod, "entry_path", None) or getattr(mod, "entry", None) or getattr(mod, "entry_path_str", None)
+    entry = getattr(mod, "entry_path", None) or getattr(mod, "entry", None)
     if not entry:
-        oled_message("LAUNCH FAIL", [mod.name, "Missing entry_path", ""], "BACK = menu")
-        time.sleep(1.2)
+        try:
+            oled_message("LAUNCH FAIL", [mod.name, "Missing entry", ""], "BACK = menu")
+        except Exception:
+            pass
+        time.sleep(1.0)
         clear()
-        oled_hard_wake()
         return
 
-    cmd = ["/home/ghostgeeks01/oledenv/bin/python", str(entry)]
+    entry_path = Path(str(entry))
+    cwd = str(entry_path.parent)
 
-    # Logging
-    log_dir = Path("/home/ghostgeeks01/oled/logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
-    mod_id = getattr(mod, "id", None) or getattr(mod, "name", "module")
-    log_path = log_dir / f"{mod_id}.log"
+    python_bin = "/home/ghostgeeks01/oledenv/bin/python"
+    cmd = [python_bin, str(entry_path)]
 
-    logf = None
+    # Environment so modules can import shared bits and use PipeWire/BT
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/home/ghostgeeks01"
+    env["GPIOZERO_PIN_FACTORY"] = "lgpio"
+    env["XDG_RUNTIME_DIR"] = "/run/user/1000"
+    env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
+
+    # Module logging
+    logs_dir = Path("/home/ghostgeeks01/oled/logs")
     try:
-        logf = open(log_path, "w", buffering=1)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    safe_name = "".join(c for c in (getattr(mod, "id", "") or getattr(mod, "name", "module")) if c.isalnum() or c in ("_", "-"))
+    if not safe_name:
+        safe_name = "module"
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = logs_dir / f"{safe_name}_{ts}.log"
+
+    try:
+        logf = open(log_path, "w", buffering=1)  # line-buffered
+    except Exception:
+        logf = None
+
+    try:
         proc = subprocess.Popen(
             cmd,
+            cwd=cwd,
+            env=env,
             stdin=subprocess.PIPE,
-            stdout=logf,
-            stderr=logf,
+            stdout=(logf if logf else subprocess.DEVNULL),
+            stderr=(subprocess.STDOUT if logf else subprocess.DEVNULL),
             text=True,
             bufsize=1,
+            start_new_session=True,  # puts child in its own process group
         )
     except Exception as e:
-        try:
-            if logf:
+        if logf:
+            try:
                 logf.write(f"Failed to launch: {e}\n")
-        except Exception:
-            pass
-        try:
-            if logf:
+            except Exception:
+                pass
+            try:
                 logf.close()
+            except Exception:
+                pass
+        try:
+            oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
         except Exception:
             pass
-
-        oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
-        time.sleep(1.4)
+        time.sleep(1.2)
         clear()
-        oled_hard_wake()
         return
 
     def send(line: str):
-        """Send one line to module stdin if still running."""
         try:
             if proc.poll() is None and proc.stdin:
                 proc.stdin.write(line + "\n")
@@ -401,79 +424,80 @@ def run_module(mod, consume, clear):
         except Exception:
             pass
 
-    # Forward events while the module runs
-    while proc.poll() is None:
-        if consume("up"):
-            send("up")
-        if consume("down"):
-            send("down")
-        if consume("select"):
-            send("select")
-        if consume("select_hold"):
-            send("select_hold")
+    # Forward at most ONE event per tick (prevents spamming)
+    order = ("up", "down", "select", "select_hold", "back")
 
-        if consume("back"):
-            # Ask module to exit gracefully
-            send("back")
-
-            # Wait briefly for clean exit
-            for _ in range(40):
-                if proc.poll() is not None:
+    try:
+        while proc.poll() is None:
+            ev = None
+            for name in order:
+                if consume(name):
+                    ev = name
                     break
-                time.sleep(0.02)
 
-            # Force stop if still alive
-            if proc.poll() is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                for _ in range(25):
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                if proc.poll() is None:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-            break
+            if ev:
+                send(ev)
 
-        time.sleep(0.02)
+                if ev == "back":
+                    # give module a moment to exit itself
+                    for _ in range(30):
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.05)
 
-    # Cleanup
-    try:
-        if proc.stdin:
-            proc.stdin.close()
-    except Exception:
-        pass
+                    # still alive -> terminate process group
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, subprocess.signal.SIGTERM)
+                        except Exception:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
 
-    try:
-        proc.wait(timeout=1.0)
-    except Exception:
+                    # final wait, then SIGKILL if required
+                    for _ in range(30):
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.05)
+
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, subprocess.signal.SIGKILL)
+                        except Exception:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                    break
+
+            time.sleep(0.02)
+
+    finally:
+        # Always close stdin/log
         try:
-            proc.kill()
+            if proc.stdin:
+                proc.stdin.close()
         except Exception:
             pass
 
-    try:
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
         if logf:
-            logf.close()
-    except Exception:
-        pass
+            try:
+                logf.write(f"\n[exit] returncode={proc.poll()}  log={log_path}\n")
+            except Exception:
+                pass
+            try:
+                logf.close()
+            except Exception:
+                pass
 
-    # Drain events so the menu doesn't "catch up" on return
-    clear()
-    time.sleep(0.08)
-    clear()
-    drain_until = time.time() + 0.25
-    while time.time() < drain_until:
-        consume("up"); consume("down"); consume("select"); consume("select_hold"); consume("back")
-        time.sleep(0.01)
-
-    # Ensure OLED wakes / redraws cleanly
-    oled_hard_wake()
-
+        # IMPORTANT: only clear button events; do NOT clear the OLED here
+        clear()
 # =====================================================
 # MAIN
 # =====================================================
