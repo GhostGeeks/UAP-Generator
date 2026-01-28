@@ -71,22 +71,17 @@ def oled_hard_wake() -> None:
     try:
         oled_init()
     except Exception:
-        # If I2C is briefly busy, retry once
         time.sleep(0.05)
         oled_init()
 
 
 def oled_guard() -> None:
-    """
-    Ensure the OLED is usable. We intentionally "over-fix" here because your observed
-    behavior is: menu is logically active but OLED sometimes stays blank until a button.
-    """
     global device
     if device is None:
         oled_hard_wake()
 
 
-# Initialize once at startup
+# Initialize once
 oled_init()
 
 
@@ -96,6 +91,11 @@ oled_init()
 def sd_write_check() -> Optional[str]:
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Errno 21 guard: if a directory exists at the test-file path, remove it.
+        if SD_TEST_FILE.exists() and SD_TEST_FILE.is_dir():
+            return f"{SD_TEST_FILE} is a directory (Errno 21). Remove it."
+
         SD_TEST_FILE.write_text("ok\n")
         try:
             SD_TEST_FILE.unlink()
@@ -155,7 +155,6 @@ def oled_message(title: str, lines: List[str], footer: str = "") -> None:
             draw.text((0, y), ln[:21], fill=255)
             y += 12
         if footer:
-            # bottom row: keep it safely visible
             draw.text((0, 52), footer[:21], fill=255)
 
 
@@ -212,12 +211,11 @@ def init_buttons():
         for k in events:
             events[k] = False
 
-    # Return button objects so they stay alive
     return consume, clear, (btn_up, btn_down, btn_select, btn_back)
 
 
 def drain_events(consume, seconds: float = 0.25) -> None:
-    """Drain any queued button events to prevent 'ghost presses' after returning from modules."""
+    """Drain queued button events to prevent ghost presses."""
     end = time.time() + seconds
     while time.time() < end:
         consume("up")
@@ -300,8 +298,7 @@ def splash() -> None:
 
 
 def draw_menu(mods: List[Module], idx: int) -> None:
-    # Always guard/wake before drawing (this is key for your "blank menu after module exit")
-    oled_hard_wake()
+    oled_guard()
     with canvas(device) as draw:
         draw.text((0, 0), "GHOST GEEKS MENU", fill=255)
         draw.line((0, 12, 127, 12), fill=255)
@@ -373,11 +370,15 @@ def settings(consume, clear) -> None:
 def run_module(mod: Module, consume, clear) -> None:
     """
     Runs a module as a child process and forwards button events to it via stdin.
-
     Expected stdin commands in module:
       up, down, select, select_hold, back
     """
     ensure_dirs()
+
+    # CRITICAL: clear/drain BEFORE launch so stale BACK never gets forwarded.
+    clear()
+    drain_events(consume, seconds=0.20)
+
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
     cmd = [str(HOME / "oledenv" / "bin" / "python"), mod.entry_path]
@@ -479,11 +480,11 @@ def run_module(mod: Module, consume, clear) -> None:
         except Exception:
             pass
 
-    # Important: prevent menu from immediately reacting to stale button states
+    # Clear and drain AGAIN after return
     clear()
-    drain_events(consume, seconds=0.25)
+    drain_events(consume, seconds=0.30)
 
-    # Important: modules may leave OLED off; wake it here
+    # Child may have left OLED off; recover here
     oled_hard_wake()
 
 
@@ -514,7 +515,7 @@ def main() -> None:
     back_pressed_at = None
 
     while True:
-        # menu watchdog refresh (fixes the “blank menu until a button” syndrome)
+        # watchdog refresh for "blank menu" recovery
         if time.time() - last_menu_draw >= MENU_REFRESH_SECONDS:
             draw_menu(modules, idx)
             last_menu_draw = time.time()
@@ -530,10 +531,14 @@ def main() -> None:
             last_menu_draw = time.time()
 
         if consume("select"):
+            # prevent the SELECT press from being forwarded accidentally in weird timings
+            clear()
+            drain_events(consume, seconds=0.10)
+
             if modules[idx].id != "none":
                 run_module(modules[idx], consume, clear)
 
-            # Always redraw menu after returning from a module
+            # Always redraw menu immediately after returning
             draw_menu(modules, idx)
             last_menu_draw = time.time()
 
@@ -565,6 +570,12 @@ def main() -> None:
                 last_menu_draw = time.time()
         else:
             back_pressed_at = None
+
+        # CRITICAL FIX:
+        # Always consume/clear any BACK press event in the menu loop.
+        # Otherwise it will linger and get forwarded to the next launched module,
+        # causing the module to immediately exit with exit_code=0.
+        consume("back")
 
         time.sleep(0.02)
 
