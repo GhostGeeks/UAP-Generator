@@ -317,44 +317,91 @@ def settings(consume, clear):
 
 
 # =====================================================
-# MODULE RUNNER (critical: wake OLED after child exits)
+# MODULE RUNNER
 # =====================================================
-
 def run_module(mod, consume, clear):
     """
-    Runs a module as a child process and forwards button events to it via stdin.
+    Run a module as a child process and forward button events to it via stdin.
 
-    Expected stdin commands in the module:
+    Expected stdin commands in the module (one per line):
       up, down, select, select_hold, back
+
+    Behavior:
+      - BACK in the parent requests module exit (sends "back"),
+        then terminates if it doesn't quit quickly.
+      - On return, drains queued events so the menu doesn't "catch up"
+        and forces an OLED wake/redraw.
+      - Logs module stdout/stderr to: ~/oled/logs/<module_id>.log
     """
-    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
+    from pathlib import Path
+    import subprocess
+    import time
 
-    cmd = ["/home/ghostgeeks01/oledenv/bin/python", mod.entry_path]
+    # Show launch screen
+    oled_message("RUNNING", [mod.name, getattr(mod, "subtitle", "")], "BACK = exit")
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-        )
-    except Exception as e:
-        oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
+    # Clear any pending events before launch (prevents immediate exit)
+    clear()
+    for _ in range(8):
+        consume("up"); consume("down"); consume("select"); consume("select_hold"); consume("back")
+        time.sleep(0.005)
+
+    # Build command
+    entry = getattr(mod, "entry_path", None) or getattr(mod, "entry", None) or getattr(mod, "entry_path_str", None)
+    if not entry:
+        oled_message("LAUNCH FAIL", [mod.name, "Missing entry_path", ""], "BACK = menu")
         time.sleep(1.2)
         clear()
         oled_hard_wake()
         return
 
-    def send(cmd_text: str):
+    cmd = ["/home/ghostgeeks01/oledenv/bin/python", str(entry)]
+
+    # Logging
+    log_dir = Path("/home/ghostgeeks01/oled/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    mod_id = getattr(mod, "id", None) or getattr(mod, "name", "module")
+    log_path = log_dir / f"{mod_id}.log"
+
+    logf = None
+    try:
+        logf = open(log_path, "w", buffering=1)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=logf,
+            stderr=logf,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        try:
+            if logf:
+                logf.write(f"Failed to launch: {e}\n")
+        except Exception:
+            pass
+        try:
+            if logf:
+                logf.close()
+        except Exception:
+            pass
+
+        oled_message("LAUNCH FAIL", [mod.name, str(e)[:21], ""], "BACK = menu")
+        time.sleep(1.4)
+        clear()
+        oled_hard_wake()
+        return
+
+    def send(line: str):
+        """Send one line to module stdin if still running."""
         try:
             if proc.poll() is None and proc.stdin:
-                proc.stdin.write(cmd_text + "\n")
+                proc.stdin.write(line + "\n")
                 proc.stdin.flush()
         except Exception:
             pass
 
+    # Forward events while the module runs
     while proc.poll() is None:
         if consume("up"):
             send("up")
@@ -366,23 +413,35 @@ def run_module(mod, consume, clear):
             send("select_hold")
 
         if consume("back"):
+            # Ask module to exit gracefully
             send("back")
 
-            # allow graceful exit
-            for _ in range(30):
+            # Wait briefly for clean exit
+            for _ in range(40):
                 if proc.poll() is not None:
                     break
                 time.sleep(0.02)
 
+            # Force stop if still alive
             if proc.poll() is None:
                 try:
                     proc.terminate()
                 except Exception:
                     pass
+                for _ in range(25):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
             break
 
         time.sleep(0.02)
 
+    # Cleanup
     try:
         if proc.stdin:
             proc.stdin.close()
@@ -397,20 +456,22 @@ def run_module(mod, consume, clear):
         except Exception:
             pass
 
-    # Clear & drain queued button events so menu doesn't "ghost"
+    try:
+        if logf:
+            logf.close()
+    except Exception:
+        pass
+
+    # Drain events so the menu doesn't "catch up" on return
     clear()
     time.sleep(0.08)
     clear()
-
-    drain_until = time.time() + 0.20
+    drain_until = time.time() + 0.25
     while time.time() < drain_until:
-        consume("up")
-        consume("down")
-        consume("select")
-        consume("select_hold")
-        consume("back")
+        consume("up"); consume("down"); consume("select"); consume("select_hold"); consume("back")
         time.sleep(0.01)
 
+    # Ensure OLED wakes / redraws cleanly
     oled_hard_wake()
 
 # =====================================================
