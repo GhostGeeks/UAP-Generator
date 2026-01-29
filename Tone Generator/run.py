@@ -7,7 +7,6 @@ import subprocess
 import threading
 import select
 from dataclasses import dataclass
-from pathlib import Path
 
 from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
@@ -36,8 +35,17 @@ def render(draw_fn):
         draw_fn(d)
 
 
-def draw_header(d, title: str):
+def _text_w_px(s: str) -> int:
+    # luma default font ~6px per char
+    return len(s) * 6
+
+
+def draw_header(d, title: str, status: str = ""):
     d.text((2, HEADER_Y), title[:21], fill=255)
+    if status:
+        s = status[:6]
+        x = max(0, OLED_W - _text_w_px(s) - 2)
+        d.text((x, HEADER_Y), s, fill=255)
     d.line((0, DIVIDER_Y, 127, DIVIDER_Y), fill=255)
 
 
@@ -116,9 +124,10 @@ class ToneEngine:
         self._close_proc()
 
     def _pick_player(self):
-        # Prefer PipeWire
+        # Prefer PipeWire if available
         if subprocess.call(["bash", "-lc", "command -v pw-cat >/dev/null 2>&1"]) == 0:
             return ["pw-cat", "--playback", "--rate", str(RATE), "--channels", str(CH), "--format", "s16le"]
+        # Fallback to ALSA
         return ["aplay", "-q", "-f", "S16_LE", "-r", str(RATE), "-c", str(CH), "-t", "raw", "-"]
 
     def _ensure_proc(self):
@@ -161,10 +170,8 @@ class ToneEngine:
         for _ in range(FRAMES_PER_CHUNK):
             v = math.sin(ph) * amp
             s = int(max(-1.0, min(1.0, v)) * 32767)
-            # stereo interleaved
-            out += struct.pack("<h", s)
-            out += struct.pack("<h", s)
-
+            out += struct.pack("<h", s)  # L
+            out += struct.pack("<h", s)  # R
             ph += inc
             if ph > TWOPI:
                 ph -= TWOPI
@@ -184,10 +191,7 @@ class ToneEngine:
                 continue
 
             self._ensure_proc()
-
             amp = max(0.0, min(1.0, self.st.volume / 100.0))
-
-            # Determine hz by mode
             hz = self.st.hz
 
             if self.st.mode == "PULSE":
@@ -204,7 +208,7 @@ class ToneEngine:
                         self._pulse_on = True
 
             elif self.st.mode == "SWEEP":
-                # generate at current sweep hz
+                # play at current sweep freq
                 buf = self._gen_sine(self._sweep_hz, amp)
 
                 self._sweep_acc += tick_ms
@@ -217,8 +221,7 @@ class ToneEngine:
                     elif self._sweep_hz <= self.st.sweep_start:
                         self._sweep_hz = self.st.sweep_start
                         self._sweep_dir = 1
-
-            else:  # STEADY
+            else:
                 buf = self._gen_sine(hz, amp)
 
             self._write(buf)
@@ -242,12 +245,14 @@ def menu_screen(sel):
 
 def play_screen(st: ToneState):
     def _draw(d):
-        draw_header(d, "TONE")
+        status = "PLAY" if st.playing else "STOP"
+        draw_header(d, "TONE", status=status)
+
         d.text((2, LIST_Y0), f"Mode: {st.mode}"[:21], fill=255)
         d.text((2, LIST_Y0 + 12), f"{st.hz:.1f} Hz"[:21], fill=255)
         d.text((2, LIST_Y0 + 24), f"VOL {st.volume}%"[:21], fill=255)
-        status = "PLAYING" if st.playing else "STOPPED"
-        d.text((2, LIST_Y0 + 36), status[:21], fill=255)
+
+        # no more status line down here (prevents footer overlap)
         draw_footer(d, "SEL toggle  HOLD cfg  BK")
     return _draw
 
@@ -264,17 +269,18 @@ def settings_screen(st: ToneState, sel_idx: int):
 
     def _draw(d):
         draw_header(d, "SETTINGS")
-        # show first 4 cleanly; scroll if needed
         start = 0
         visible = 3
         if sel_idx >= visible:
             start = sel_idx - (visible - 1)
+
         for r in range(visible):
             i = start + r
             if i >= len(items):
                 break
             k, v = items[i]
             draw_row(d, LIST_Y0 + r * ROW_H, f"{k}: {v}", selected=(i == sel_idx))
+
         draw_footer(d, "^v adj  SEL mode  BK")
     return _draw, len(items)
 
@@ -289,7 +295,7 @@ def clamp(v, lo, hi):
 def main():
     st = ToneState()
     engine = ToneEngine(st)
-    engine.start()  # thread idle unless playing
+    engine.start()  # thread idle unless playing=True
 
     STATE_MENU = "MENU"
     STATE_PLAY = "PLAY"
@@ -299,13 +305,18 @@ def main():
     menu_sel = 0
     cfg_sel = 0
 
+    # BACK cooldown prevents the "double-back" behavior:
+    # if you hold/press BACK to return from PLAY->MENU, the next tick can still read BACK
+    # and MENU would immediately exit. This blocks that.
+    back_cooldown_until = 0.0
+
     while True:
         if state == STATE_MENU:
             render(menu_screen(menu_sel))
         elif state == STATE_PLAY:
             render(play_screen(st))
         elif state == STATE_CFG:
-            draw_fn, n = settings_screen(st, cfg_sel)
+            draw_fn, _n = settings_screen(st, cfg_sel)
             render(draw_fn)
 
         ev = read_event()
@@ -313,9 +324,17 @@ def main():
             time.sleep(0.02)
             continue
 
+        now = time.monotonic()
+
         # -------- MENU --------
         if state == STATE_MENU:
-            if ev == "up":
+            if ev == "back":
+                if now < back_cooldown_until:
+                    # ignore "stale" back
+                    pass
+                else:
+                    break  # exit module only from top menu
+            elif ev == "up":
                 menu_sel = (menu_sel - 1) % len(MAIN_ITEMS)
             elif ev == "down":
                 menu_sel = (menu_sel + 1) % len(MAIN_ITEMS)
@@ -323,8 +342,6 @@ def main():
                 st.mode = MAIN_ITEMS[menu_sel].upper()
                 st.playing = False
                 state = STATE_PLAY
-            elif ev == "back":
-                break  # EXIT MODULE only from top menu
 
         # -------- PLAY --------
         elif state == STATE_PLAY:
@@ -336,6 +353,7 @@ def main():
             elif ev == "back":
                 st.playing = False
                 state = STATE_MENU
+                back_cooldown_until = time.monotonic() + 0.35
             elif ev == "up":
                 st.volume = clamp(st.volume + 5, 0, 100)
             elif ev == "down":
@@ -343,10 +361,11 @@ def main():
 
         # -------- CFG --------
         elif state == STATE_CFG:
-            draw_fn, n = settings_screen(st, cfg_sel)
+            _draw_fn, n = settings_screen(st, cfg_sel)
 
             if ev == "back":
                 state = STATE_PLAY
+                back_cooldown_until = time.monotonic() + 0.25
             elif ev == "select":
                 # cycle mode quickly
                 if st.mode == "STEADY":
@@ -355,6 +374,8 @@ def main():
                     st.mode = "SWEEP"
                 else:
                     st.mode = "STEADY"
+            elif ev == "select_hold":
+                cfg_sel = (cfg_sel + 1) % n
             elif ev == "up":
                 if cfg_sel == 0: st.hz = clamp(st.hz + 1.0, 1.0, 20000.0)
                 if cfg_sel == 1: st.volume = clamp(st.volume + 5, 0, 100)
@@ -369,10 +390,6 @@ def main():
                 if cfg_sel == 3: st.pulse_off_ms = clamp(st.pulse_off_ms - 50, 50, 2000)
                 if cfg_sel == 4: st.sweep_step = clamp(st.sweep_step - 1.0, 0.1, 2000.0)
                 if cfg_sel == 5: st.sweep_step_ms = clamp(st.sweep_step_ms - 50, 50, 2000)
-
-            # navigate fields with select_hold (nice on OLED)
-            if ev == "select_hold":
-                cfg_sel = (cfg_sel + 1) % n
 
         time.sleep(0.02)
 
