@@ -363,17 +363,20 @@ def poweroff() -> None:
 # =====================================================
 def settings(consume, clear) -> None:
     clear()
+    ver = read_version()
+    did_full = read_device_id()
+    did = short_device_id(did_full)
+
     while True:
         oled_message(
             "SETTINGS",
-            [hostname(), f"IP {get_ip()}", f"UP {uptime_short()}"],
+            [hostname(), f"IP {get_ip()}", f"v{ver} ID:{did}"],
             "BACK = menu",
         )
         if consume("back"):
             clear()
             return
         time.sleep(0.1)
-
 
 # =====================================================
 # MODULE RUNNER

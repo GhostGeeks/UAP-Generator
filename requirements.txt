@@ -1,0 +1,8 @@
+# OLED + Display
+luma.oled==3.13.0
+luma.core==2.4.2
+Pillow>=10.0.0
+
+# GPIO
+gpiozero>=2.0
+lgpio>=0.2.2.0
