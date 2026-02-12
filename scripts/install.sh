@@ -87,4 +87,16 @@ User=$APP_USER
 WorkingDirectory=$INSTALL_DIR
 Environment=PYTHONUNBUFFERED=1
 Environment=GPIOZERO_PIN_FACTORY=lgpio
-ExecStart=$VENV_DIR/bin/py_
+ExecStart=$VENV_DIR/bin/python $APP_PATH
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
+
+echo "==> Install complete."
