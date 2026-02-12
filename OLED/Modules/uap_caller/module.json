@@ -1,0 +1,9 @@
+{
+  "id": "uap_caller",
+  "name": "UAP Caller",
+  "subtitle": "Audio signal generator",
+  "entry": "run.py",
+  "enabled": true,
+  "order": 40
+}
+
