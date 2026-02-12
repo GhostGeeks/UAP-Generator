@@ -398,52 +398,140 @@ def bluetooth_autoconnect_ui() -> bool:
     return False
 
 # =====================================================
-# STATUS INDICATORS (Wi-Fi + Bluetooth)
+# STATUS INDICATORS (Wi-Fi bars + Bluetooth icon)
 # =====================================================
 
 _last_status_check = 0.0
-_status_wifi_ok = False
-_status_bt_ok = False
+_wifi_bars = 0           # 0..3
+_bt_ok = False
 _status_bt_mac = ""
 
 
-def _text_width_px(s: str) -> int:
-    # Default luma text uses a small bitmap font ~6px/char
-    return max(0, len(s)) * 6
+def wifi_rssi_dbm(interface: str = "wlan0") -> Optional[int]:
+    """
+    Returns RSSI in dBm (e.g., -52) or None if not connected/unknown.
+    Uses: iw dev wlan0 link
+    """
+    try:
+        r = subprocess.run(
+            ["iw", "dev", interface, "link"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        out = (r.stdout or "").splitlines()
+        # If not connected, output often contains "Not connected."
+        if any("Not connected" in ln for ln in out):
+            return None
+
+        for ln in out:
+            ln = ln.strip().lower()
+            # Example: "signal: -52 dBm"
+            if ln.startswith("signal:"):
+                parts = ln.replace("dbm", "").split()
+                # parts like ["signal:", "-52"]
+                for p in parts:
+                    if p.lstrip("-").isdigit():
+                        return int(p)
+        return None
+    except Exception:
+        return None
 
 
-def _draw_right(draw, y: int, text: str) -> None:
-    x = max(0, OLED_W - _text_width_px(text))
-    draw.text((x, y), text, fill=255)
+def wifi_bars_from_rssi(rssi: Optional[int]) -> int:
+    """
+    Map RSSI (dBm) to 0..3 bars.
+    Typical guidance:
+      >= -55: excellent (3)
+      >= -67: good      (2)
+      >= -80: fair      (1)
+      else:   weak/off  (0)
+    """
+    if rssi is None:
+        return 0
+    if rssi >= -55:
+        return 3
+    if rssi >= -67:
+        return 2
+    if rssi >= -80:
+        return 1
+    return 0
+
+
+def draw_wifi_bars(draw, x_right: int, y_top: int, bars: int) -> int:
+    """
+    Draw 0..3 Wi-Fi bars ending at x_right.
+    Returns the left-most x used (so caller can place other icons to the left).
+    """
+    # Bar geometry
+    w = 2
+    gap = 1
+    heights = [3, 6, 9]  # 3 bars
+    total_w = 3 * w + 2 * gap
+    x0 = x_right - total_w
+
+    # Draw outline bars (unfilled)
+    for i, h in enumerate(heights):
+        x = x0 + i * (w + gap)
+        y0 = y_top + (9 - h)
+        draw.rectangle((x, y0, x + w - 1, y_top + 9), outline=255, fill=0)
+
+    # Fill bars up to 'bars'
+    for i in range(min(3, max(0, bars))):
+        h = heights[i]
+        x = x0 + i * (w + gap)
+        y0 = y_top + (9 - h)
+        draw.rectangle((x, y0, x + w - 1, y_top + 9), outline=255, fill=255)
+
+    return x0
+
+
+def draw_bt_icon(draw, x_right: int, y_top: int, connected: bool) -> int:
+    """
+    Draw a tiny Bluetooth indicator at the top-right area.
+    We'll do 'B' plus a dot that is filled when connected.
+    Returns the left-most x used.
+    """
+    # Small "B"
+    text = "B"
+    # Put text so its right edge is at x_right
+    x_text = max(0, x_right - 6)  # ~6px per char
+    draw.text((x_text, y_top), text, fill=255)
+
+    # Dot to the left of the B
+    dot_x = x_text - 5
+    dot_y = y_top + 3
+    if connected:
+        draw.ellipse((dot_x, dot_y, dot_x + 3, dot_y + 3), outline=255, fill=255)
+    else:
+        draw.ellipse((dot_x, dot_y, dot_x + 3, dot_y + 3), outline=255, fill=0)
+
+    return dot_x
 
 
 def status_refresh(force: bool = False) -> None:
     """
-    Refresh Wi-Fi + BT status at most ~every 2 seconds (unless forced).
-    Keeps menu feeling live without hammering bluetoothctl.
+    Refresh Wi-Fi + BT status at most every ~2 seconds (unless forced).
     """
-    global _last_status_check, _status_wifi_ok, _status_bt_ok
+    global _last_status_check, _wifi_bars, _bt_ok
 
     now = time.time()
     if (not force) and (now - _last_status_check) < 2.0:
         return
     _last_status_check = now
 
-    ip = get_ip()
-    _status_wifi_ok = bool(ip)
-
-    if _status_bt_mac:
-        _status_bt_ok = bluetooth_is_connected(_status_bt_mac)
+    # Wi-Fi bars: use RSSI if possible; fall back to "has IP" => 1 bar
+    rssi = wifi_rssi_dbm("wlan0")
+    if rssi is None:
+        _wifi_bars = 1 if get_ip() else 0
     else:
-        _status_bt_ok = False
+        _wifi_bars = wifi_bars_from_rssi(rssi)
 
-
-def status_string() -> str:
-    # W = Wi-Fi, B = Bluetooth
-    w = "W✓" if _status_wifi_ok else "W✕"
-    b = "B✓" if _status_bt_ok else "B✕"
-    return f"{w} {b}"
-
+    # BT connected?
+    if _status_bt_mac:
+        _bt_ok = bluetooth_is_connected(_status_bt_mac)
+    else:
+        _bt_ok = False
 
 # =====================================================
 # UI SCREENS
@@ -470,33 +558,31 @@ def draw_menu(mods: List[Module], idx: int) -> None:
 
     oled_guard()
     with canvas(device) as draw:
-        draw.text((0, 0), "GHOST GEEKS", fill=255)
-        _draw_right(draw, 0, status_string())
+        # Header left
+        draw.text((0, 0), "GHOST GEEKS MENU", fill=255)
+
+        # Header right: Bluetooth + Wi-Fi bars
+        # Start from far-right and draw BT, then Wi-Fi to its left
+        x = OLED_W - 1
+        x = draw_bt_icon(draw, x_right=x, y_top=0, connected=_bt_ok) - 3
+        _ = draw_wifi_bars(draw, x_right=x, y_top=1, bars=_wifi_bars)
 
         draw.line((0, 12, 127, 12), fill=255)
-
-        # Optional: small network hint line (kept short)
-        ip = get_ip()
-        if ip:
-            draw.text((0, 14), f"IP {ip}"[:21], fill=255)
-        else:
-            draw.text((0, 14), "NO NETWORK"[:21], fill=255)
 
         visible_rows = 3
         start_i = 0
         if len(mods) > visible_rows:
             start_i = max(0, min(idx - 1, len(mods) - visible_rows))
 
-        # Menu rows start a bit lower now because we show IP line
-        base_y = 26
         for row in range(visible_rows):
             i = start_i + row
             if i >= len(mods):
                 break
             prefix = ">" if i == idx else " "
-            draw.text((0, base_y + row * 12), f"{prefix} {mods[i].name}"[:21], fill=255)
+            draw.text((0, 16 + row * 12), f"{prefix} {mods[i].name}"[:21], fill=255)
 
-        draw.text((0, 52), "SEL run  HOLD=cfg", fill=255)
+        draw.text((0, 52), "SEL=run  HOLD=cfg", fill=255)
+
 
 # =====================================================
 # POWER CONFIRM
