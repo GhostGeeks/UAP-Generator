@@ -82,8 +82,12 @@ def load_settings():
 
 
 def save_settings(s):
-    SETTINGS_FILE.write_text(json.dumps(s, indent=2))
-
+    try:
+        SETTINGS_FILE.write_text(json.dumps(s, indent=2))
+    except Exception as e:
+        # Fail silently in production so module keeps running
+        # Optional: print(e) for debugging
+        pass
 
 # ============================================================
 # UI DRAW HELPERS

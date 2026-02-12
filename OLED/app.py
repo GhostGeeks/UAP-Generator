@@ -2,6 +2,7 @@
 import os
 os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
 
+import sys
 import time
 import math
 import json
@@ -35,9 +36,19 @@ SELECT_HOLD_SECONDS = 1.0
 BACK_REBOOT_HOLD = 2.0
 BACK_POWEROFF_HOLD = 5.0
 
-HOME = Path("/home/ghostgeeks01")
-APP_DIR = HOME / "oled"
-MODULE_DIR = APP_DIR / "modules"
+# -----------------------------
+# Deployment-root (new plan)
+# -----------------------------
+# Default install location:
+#   /opt/blackbox
+# Override by setting env var BLACKBOX_ROOT=/some/path
+ROOT = Path(os.environ.get("BLACKBOX_ROOT", "/opt/blackbox")).resolve()
+
+# Repository layout:
+#   /opt/blackbox/OLED/app.py
+#   /opt/blackbox/OLED/Modules/<module>/module.json
+APP_DIR = ROOT / "OLED"
+MODULE_DIR = APP_DIR / "Modules"
 LOG_DIR = APP_DIR / "logs"
 SD_TEST_FILE = APP_DIR / ".sd_write_test"
 
@@ -381,7 +392,8 @@ def run_module(mod: Module, consume, clear) -> None:
 
     oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
-    cmd = [str(HOME / "oledenv" / "bin" / "python"), mod.entry_path]
+    # Use the same interpreter as this app (systemd service should run inside venv)
+    cmd = [sys.executable, mod.entry_path]
 
     log_path = log_path_for(mod.id)
     try:
@@ -505,7 +517,11 @@ def main() -> None:
 
     modules = discover_modules(MODULE_DIR)
     if not modules:
-        oled_message("NO MODULES", ["Add under ~/oled/modules", "", ""], "HOLD=cfg")
+        oled_message(
+            "NO MODULES",
+            [f"Add under {MODULE_DIR}", "", ""],
+            "HOLD=cfg",
+        )
         modules = [Module(id="none", name="(none)", subtitle="", entry_path="/bin/false", order=0)]
 
     idx = 0
