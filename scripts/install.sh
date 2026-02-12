@@ -33,17 +33,18 @@ apt update
 apt install -y \
   git \
   python3 python3-venv python3-pip \
-  python3-dev \
-  build-essential \
-  swig \
   i2c-tools \
   alsa-utils pulseaudio-utils \
   bluez \
-  liblgpio1 liblgpio-dev \
   libjpeg-dev zlib1g-dev \
   libfreetype6-dev \
   fonts-dejavu-core \
-  raspi-config
+  raspi-config \
+  swig \
+  build-essential \
+  python3-dev \
+  liblgpio-dev \
+  liblgpio1
 
 # =========================
 # ENABLE I2C
