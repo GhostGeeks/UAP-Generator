@@ -6,6 +6,7 @@ import sys
 import time
 import math
 import json
+import selectors
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -798,8 +799,9 @@ def run_module(mod: Module, consume, clear) -> None:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
-            stdout=logf if logf else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=logf if logf else subprocess.DEVNULL,
+
             text=True,
             bufsize=1,
         )
@@ -883,19 +885,77 @@ def run_module(mod: Module, consume, clear) -> None:
     # Child may have left OLED off; recover here
     oled_hard_wake()
 
+# -----------------------------
+# Module UI state
+# -----------------------------
+out_sel = selectors.DefaultSelector()
+if proc.stdout:
+    out_sel.register(proc.stdout, selectors.EVENT_READ)
+
+page = "build"
+build_pct = 0.0
+build_step = ""
+playing = False
+elapsed_s = 0
+
+
+def draw_build():
+    oled_message(
+        "UAP Call Sig",
+        [build_step, f"{int(build_pct*100):3d}%"],
+        "Loading..."
+    )
+
+
+def draw_playback():
+    mm, ss = divmod(elapsed_s, 60)
+    st = "PLAYING" if playing else "READY"
+    oled_message(
+        "UAP Caller",
+        [st, f"Time {mm:02d}:{ss:02d}"],
+        "SEL=Play  BACK"
+    )
+
+
+def pump_stdout():
+    nonlocal page, build_pct, build_step, playing, elapsed_s
+
+    for key, _ in out_sel.select(timeout=0):
+        line = key.fileobj.readline()
+        if not line:
+            return
+        try:
+            msg = json.loads(line)
+        except Exception:
+            return
+
+        t = msg.get("type")
+
+        if t == "page":
+            page = msg.get("name", page)
+
+        elif t == "build":
+            build_pct = float(msg.get("pct", build_pct))
+            build_step = str(msg.get("step", build_step))
+
+        elif t == "state":
+            playing = bool(msg.get("playing", playing))
+            elapsed_s = int(msg.get("elapsed_s", elapsed_s))
 
 # =====================================================
 # MAIN
 # =====================================================
 def main() -> None:
-    if (err := sd_write_check()) is not None:
+    # ---- Early SD guard (hard stop) ----
+    err = sd_write_check()
+    if err is not None:
         oled_message("SD ERROR", [err[:21], "", ""], "")
         while True:
             time.sleep(1)
 
     ensure_dirs()
     consume, clear, buttons = init_buttons()
-    btn_up, btn_down, btn_select, btn_back = buttons
+    _, _, _, btn_back = buttons
 
     startup_sequence(consume, clear)
     status_refresh(force=True)
@@ -906,70 +966,77 @@ def main() -> None:
         modules = [Module(id="none", name="(none)", subtitle="", entry_path="/bin/false", order=0)]
 
     idx = 0
-    draw_menu(modules, idx)
-    last_menu_draw = time.time()
-
+    last_menu_draw = 0.0  # force immediate draw
     back_pressed_at = None
 
-    while True:
-        # watchdog refresh for "blank menu" recovery
-        if time.time() - last_menu_draw >= MENU_REFRESH_SECONDS:
-            draw_menu(modules, idx)
-            last_menu_draw = time.time()
+    def redraw_menu() -> None:
+        nonlocal last_menu_draw
+        draw_menu(modules, idx)
+        last_menu_draw = time.time()
 
+    redraw_menu()
+
+    while True:
+        now = time.time()
+
+        # ---- Watchdog refresh (blank menu recovery) ----
+        if now - last_menu_draw >= MENU_REFRESH_SECONDS:
+            redraw_menu()
+
+        # ---- Navigation ----
         if consume("up"):
             idx = (idx - 1) % len(modules)
-            draw_menu(modules, idx)
-            last_menu_draw = time.time()
+            redraw_menu()
 
         if consume("down"):
             idx = (idx + 1) % len(modules)
-            draw_menu(modules, idx)
-            last_menu_draw = time.time()
+            redraw_menu()
 
+        # ---- Select: run module ----
         if consume("select"):
-            # prevent the SELECT press from being forwarded accidentally in weird timings
+            # Prevent SELECT press from forwarding into the module at launch timing
             clear()
             drain_events(consume, seconds=0.10)
 
             if modules[idx].id != "none":
                 run_module(modules[idx], consume, clear)
 
-            # Always redraw menu immediately after returning
-            draw_menu(modules, idx)
-            last_menu_draw = time.time()
+            # Always redraw menu immediately after returning from a module
+            redraw_menu()
 
+        # ---- Hold Select: settings ----
         if consume("select_hold"):
             settings(consume, clear)
-            draw_menu(modules, idx)
-            last_menu_draw = time.time()
+            redraw_menu()
 
-        # BACK holds for reboot/poweroff
+        # ---- BACK hold: reboot/poweroff (uses raw button state) ----
         if btn_back.is_pressed:
             if back_pressed_at is None:
-                back_pressed_at = time.time()
-            held = time.time() - back_pressed_at
+                back_pressed_at = now
 
+            held = now - back_pressed_at
+
+            # Prioritize the longer hold first (poweroff > reboot)
             if held >= BACK_POWEROFF_HOLD:
                 if confirm_action("POWEROFF?", consume, clear):
                     poweroff()
                     return
                 back_pressed_at = None
-                draw_menu(modules, idx)
-                last_menu_draw = time.time()
+                redraw_menu()
 
             elif held >= BACK_REBOOT_HOLD:
                 if confirm_action("REBOOT?", consume, clear):
                     reboot()
                     return
                 back_pressed_at = None
-                draw_menu(modules, idx)
-                last_menu_draw = time.time()
+                redraw_menu()
+
         else:
             back_pressed_at = None
 
-        # CRITICAL FIX:
-        # Always consume/clear any BACK press event in the menu loop.
+        # ---- CRITICAL FIX ----
+        # Always eat any queued BACK events while in the menu loop.
+        # Otherwise a stale BACK can leak into a module launch/return path.
         consume("back")
 
         time.sleep(0.02)

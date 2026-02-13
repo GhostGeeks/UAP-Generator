@@ -2,379 +2,324 @@
 import os
 import sys
 import time
-import math
+import json
 import wave
-import random
-import signal
 import shutil
+import signal
 import subprocess
 from pathlib import Path
-from typing import Optional, List, Dict
-import selectors
-
-from luma.core.interface.serial import i2c
-from luma.oled.device import ssd1306
-from luma.core.render import canvas
-
+from typing import Optional
 
 # -----------------------------
-# OLED config
-# -----------------------------
-I2C_PORT = 1
-I2C_ADDR = 0x3C
-OLED_W, OLED_H = 128, 64
-
-serial = i2c(port=I2C_PORT, address=I2C_ADDR)
-device = ssd1306(serial, width=OLED_W, height=OLED_H)
-
-# -----------------------------
-# Paths
+# Cache paths
 # -----------------------------
 HERE = Path(__file__).resolve().parent
 CACHE_DIR = HERE / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-OUT_WAV = CACHE_DIR / "uap_output.wav"
-OUT_WAV_TMP = CACHE_DIR / "uap_output.wav.tmp"
+
+OUT_WAV = CACHE_DIR / "uap3_signature.wav"
+OUT_TMP = CACHE_DIR / "uap3_signature.wav.tmp"
+META_JSON = CACHE_DIR / "uap3_signature.meta.json"
 
 # -----------------------------
-# Audio config
+# Audio config (Pi Zero 2W safe)
 # -----------------------------
 SAMPLE_RATE = 44100
 CHANNELS = 1
-SAMPWIDTH_BYTES = 2  # 16-bit PCM
+SAMPWIDTH_BYTES = 2
 
-# Reliability knobs for Pi Zero 2W
-WRITE_CHUNK_FRAMES = 1024  # small, steady chunk writes
-DEFAULT_DURATION_S = 60     # per run (preset can override)
-FADE_MS = 20               # click-free start/stop
+# 10-min master signature (loop playback for continuous operation)
+DEFAULT_DURATION_S = 600
+DURATION_S = int(os.environ.get("UAP_DURATION_S", str(DEFAULT_DURATION_S)))
+
+# Crafted layer settings (from your base generator)
+SCHUMANN_FREQ = 7.83
+CARRIER_FREQ = 100.0
+HARMONIC_BASE_FREQ = 528.0
+AMBIENT_BASE_FREQ = 432.0
+
+AMP_SCHUMANN = 0.15
+AMP_HARMONIC = 0.15
+AMP_PING = 0.10
+AMP_CHIRP = 0.10
+AMP_AMBIENT = 0.20
+AMP_BREATH = 0.15
+
+BREATH_SEED = 1337
+CHUNK_SECONDS = 5
+
+SIGNATURE_VERSION = "uap3_signature_v4_headless"
 
 running = True
+play_proc: Optional[subprocess.Popen] = None
+started_at: Optional[float] = None
+
+
+def emit(obj: dict) -> None:
+    """Send status to app.py (one JSON object per line)."""
+    try:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 # -----------------------------
-# Presets (audio-first, timed, predictable)
+# Playback (no BT management here)
 # -----------------------------
-# All presets are "generators" that create a single wav for reliable playback.
-# Keep computations light; avoid heavy filters.
-PRESETS: List[Dict] = [
-    {
-        "name": "SCAN SWEEP",
-        "subtitle": "Slow sweep + noise",
-        "duration_s": 75,
-        "base_amp": 0.28,
-        "noise_amp": 0.05,
-        "kind": "sweep",
-        "f0": 180.0,
-        "f1": 980.0,
-        "sweep_period_s": 9.0,   # how long for up/down
-        "pulse_hz": 0.0,
-    },
-    {
-        "name": "PULSE BEACON",
-        "subtitle": "Pulsed tone bursts",
-        "duration_s": 60,
-        "base_amp": 0.30,
-        "noise_amp": 0.03,
-        "kind": "pulse",
-        "tone_hz": 432.0,
-        "pulse_hz": 0.8,         # pulses per second
-        "duty": 0.25,            # pulse on fraction
-    },
-    {
-        "name": "CHIRP PINGS",
-        "subtitle": "Short chirps + hiss",
-        "duration_s": 60,
-        "base_amp": 0.26,
-        "noise_amp": 0.05,
-        "kind": "chirp",
-        "chirp_every_s": 1.5,
-        "chirp_len_s": 0.12,
-        "chirp_f0": 900.0,
-        "chirp_f1": 1800.0,
-    },
-    {
-        "name": "DRONE HUM",
-        "subtitle": "Thick multi-tone",
-        "duration_s": 90,
-        "base_amp": 0.23,
-        "noise_amp": 0.02,
-        "kind": "drone",
-        "tones": [110.0, 220.0, 440.0],
-        "wobble_hz": 0.18,       # slow amplitude wobble
-    },
-    {
-        "name": "RANDOM HOPS",
-        "subtitle": "Freq hops + noise",
-        "duration_s": 75,
-        "base_amp": 0.28,
-        "noise_amp": 0.05,
-        "kind": "hop",
-        "hop_every_s": 1.0,
-        "hop_band": (250.0, 1400.0),
-    },
-]
-
-
-# -----------------------------
-# OLED helpers
-# -----------------------------
-def oled_message(title: str, lines=None, footer: str = ""):
-    lines = lines or []
-    with canvas(device) as draw:
-        draw.text((0, 0), title[:21], fill=255)
-        draw.line((0, 12, 127, 12), fill=255)
-        y = 16
-        for ln in lines[:3]:
-            draw.text((0, y), str(ln)[:21], fill=255)
-            y += 12
-        if footer:
-            draw.text((0, 54), footer[:21], fill=255)
-
-
-def oled_status(preset_name: str, subtitle: str, state: str, t_left: int, anim: int, level: float):
-    """
-    World-class OLED: always answers:
-      - what mode/preset?
-      - what is it doing now?
-      - how long left?
-      - subtle motion (heartbeat) + level meter
-    """
-    # level 0..1
-    level = max(0.0, min(1.0, level))
-    bars = int(level * 10)
-
-    with canvas(device) as draw:
-        draw.text((0, 0), preset_name[:21], fill=255)
-        draw.line((0, 12, 127, 12), fill=255)
-        draw.text((0, 16), subtitle[:21], fill=255)
-        draw.text((0, 28), state[:21], fill=255)
-
-        mm = t_left // 60
-        ss = t_left % 60
-        draw.text((0, 40), f"Time: {mm:02d}:{ss:02d}", fill=255)
-
-        # Level meter right side
-        x0, y0 = 86, 40
-        draw.rectangle((x0, y0, 127, 52), outline=255, fill=0)
-        # bars inside
-        for i in range(bars):
-            bx0 = x0 + 2 + i * 4
-            draw.rectangle((bx0, y0 + 2, bx0 + 2, 50), outline=255, fill=255)
-
-        # tiny "heartbeat" animation bottom right
-        dot_x = 120 + (anim % 2)
-        draw.text((dot_x, 54), "•", fill=255)
-
-
-# -----------------------------
-# Playback helpers (no BT management)
-# -----------------------------
-def _pick_player() -> List[str]:
-    """
-    Prefer simple, reliable players available on Pi OS.
-    - aplay (ALSA) is very reliable for wav
-    - paplay is fine if PulseAudio/PipeWire is present
-    """
+def _pick_player():
     if shutil.which("aplay"):
-        # -q = quiet, -N disable ALSA resampling? (not always supported); keep minimal
         return ["aplay", "-q"]
     if shutil.which("paplay"):
         return ["paplay"]
     raise RuntimeError("No audio player found (need aplay or paplay).")
 
 
-def play_wav_blocking(path: Path) -> int:
+def is_playing() -> bool:
+    return play_proc is not None and play_proc.poll() is None
+
+
+def playback_elapsed() -> int:
+    if started_at is None:
+        return 0
+    return int(time.time() - started_at)
+
+
+def stop_playback() -> None:
+    global play_proc, started_at
+    if play_proc and play_proc.poll() is None:
+        try:
+            play_proc.terminate()
+            try:
+                play_proc.wait(timeout=1.0)
+            except Exception:
+                play_proc.kill()
+        except Exception:
+            pass
+    play_proc = None
+    started_at = None
+
+
+def start_playback_loop(path: Path) -> None:
+    global play_proc, started_at
+    stop_playback()
     player = _pick_player()
+
+    if player and "aplay" in player[0]:
+        play_proc = subprocess.Popen(
+            player + ["--loop=0", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    else:
+        play_proc = subprocess.Popen(
+            player + [str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    started_at = time.time()
+
+
+# -----------------------------
+# Cache/meta
+# -----------------------------
+def signature_is_ready() -> bool:
+    if not OUT_WAV.exists() or not META_JSON.exists():
+        return False
     try:
-        p = subprocess.run(player + [str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return p.returncode
+        meta = json.loads(META_JSON.read_text())
+        return (
+            meta.get("version") == SIGNATURE_VERSION and
+            int(meta.get("sample_rate", -1)) == SAMPLE_RATE and
+            int(meta.get("duration_s", -1)) == DURATION_S and
+            int(meta.get("channels", -1)) == CHANNELS
+        )
     except Exception:
-        return 1
+        return False
+
+
+def write_meta() -> None:
+    META_JSON.write_text(json.dumps({
+        "version": SIGNATURE_VERSION,
+        "sample_rate": SAMPLE_RATE,
+        "duration_s": DURATION_S,
+        "channels": CHANNELS,
+        "created_at": int(time.time())
+    }, indent=2))
 
 
 # -----------------------------
-# Audio generation (click-free, lightweight DSP)
+# Build crafted signature
 # -----------------------------
-def _clamp16(x: float) -> int:
-    if x > 1.0:
-        x = 1.0
-    elif x < -1.0:
-        x = -1.0
-    return int(x * 32767)
+def build_uap3_signature() -> None:
+    try:
+        import numpy as np
+    except Exception as e:
+        raise RuntimeError("numpy missing (install python3-numpy)") from e
 
+    total_samples = int(DURATION_S * SAMPLE_RATE)
+    chunk_size = int(CHUNK_SECONDS * SAMPLE_RATE)
+    chunks = total_samples // chunk_size
+    remainder = total_samples % chunk_size
 
-def _fade_gain(n: int, total: int, fade_frames: int) -> float:
-    """Simple linear fade in/out for click-free edges."""
-    if total <= 0:
-        return 1.0
-    if n < fade_frames:
-        return n / max(1, fade_frames)
-    if n > (total - fade_frames):
-        return max(0.0, (total - n) / max(1, fade_frames))
-    return 1.0
+    rng = np.random.default_rng(BREATH_SEED)
 
+    # cheap smoothing for breathing noise
+    klen = 64
+    kernel = np.ones(klen, dtype=np.float32) / float(klen)
 
-def generate_uap_wav(path: Path, preset: Dict, seed: Optional[int] = None):
-    """
-    Generates a single PCM wav file based on the selected preset.
-    Uses an atomic write+rename to avoid partial/corrupt outputs.
-    """
-    duration_s = int(preset.get("duration_s", DEFAULT_DURATION_S))
-    total_frames = duration_s * SAMPLE_RATE
-    fade_frames = int((FADE_MS / 1000.0) * SAMPLE_RATE)
+    steps = [
+        "Installing harmonics",
+        "Tuning resonance",
+        "Calibrating pings",
+        "Shaping chirps",
+        "Breathing envelope",
+        "Final mixdown",
+        "Normalizing output",
+    ]
 
-    base_amp = float(preset.get("base_amp", 0.28))
-    noise_amp = float(preset.get("noise_amp", 0.05))
+    start_time = time.time()
 
-    if seed is None:
-        seed = int(time.time() * 1000) & 0xFFFFFFFF
-    rng = random.Random(seed)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with wave.open(str(OUT_WAV_TMP), "wb") as wf:
+    with wave.open(str(OUT_TMP), "wb") as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(SAMPWIDTH_BYTES)
         wf.setframerate(SAMPLE_RATE)
 
-        phase = 0.0
-        twopi = 2.0 * math.pi
+        total_parts = chunks + (1 if remainder else 0)
 
-        # For hop preset
-        hop_next = 0.0
-        hop_freq = 600.0
+        for c in range(total_parts):
+            cur_size = remainder if (c == chunks and remainder) else chunk_size
+            chunk_start = c * chunk_size
+            t0 = chunk_start / SAMPLE_RATE
+            t = (np.arange(cur_size, dtype=np.float64) / SAMPLE_RATE) + t0
 
-        # For chirp preset
-        chirp_next = 0.0
+            # Layer 1
+            carrier = np.sin(2 * np.pi * CARRIER_FREQ * t)
+            modulator = 0.5 * (1.0 + np.sin(2 * np.pi * SCHUMANN_FREQ * t))
+            layer1 = modulator * carrier * AMP_SCHUMANN
 
-        # For sweep preset
-        sweep_period = float(preset.get("sweep_period_s", 8.0))
-        f0 = float(preset.get("f0", 220.0))
-        f1 = float(preset.get("f1", 880.0))
+            # Layer 2
+            sig = np.sin(2 * np.pi * HARMONIC_BASE_FREQ * t)
+            sig += 0.3 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 2.0) * t)
+            sig += 0.1 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 3.0) * t)
+            wobble = 1.0 + 0.001 * np.sin(2 * np.pi * 0.1 * t)
+            layer2 = sig * wobble * AMP_HARMONIC
 
-        # For pulse preset
-        pulse_hz = float(preset.get("pulse_hz", 0.0))
-        duty = float(preset.get("duty", 0.25))
-        tone_hz = float(preset.get("tone_hz", 432.0))
+            # Layer 3 pings
+            ping_freq = 17000.0
+            ping_dur = 0.1
+            cycle5 = np.mod(t, 5.0)
+            ping_mask = cycle5 < ping_dur
+            ping_env = np.zeros_like(t, dtype=np.float64)
+            ping_env[ping_mask] = np.sin(np.pi * (cycle5[ping_mask] / ping_dur)) ** 2
+            layer3 = np.sin(2 * np.pi * ping_freq * t) * ping_env * AMP_PING
 
-        # For drone preset
-        drone_tones = preset.get("tones", [110.0, 220.0, 440.0])
-        wobble_hz = float(preset.get("wobble_hz", 0.15))
+            # Layer 4 chirps
+            chirp_dur = 0.2
+            cycle10 = np.mod(t, 10.0)
+            chirp_mask = cycle10 < chirp_dur
+            chirp = np.zeros_like(t, dtype=np.float64)
+            if np.any(chirp_mask):
+                f0 = 2000.0
+                f1 = 3000.0
+                tr = cycle10[chirp_mask]
+                k = (f1 - f0) / chirp_dur
+                phase = 2 * np.pi * (f0 * tr + 0.5 * k * tr * tr)
+                env = np.sin(np.pi * (tr / chirp_dur)) ** 2
+                chirp[chirp_mask] = np.sin(phase) * env
+            layer4 = chirp * AMP_CHIRP
 
-        kind = preset.get("kind", "sweep")
+            # Layer 5 ambient pad
+            pad = np.sin(2 * np.pi * AMBIENT_BASE_FREQ * t)
+            pad += 0.5 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 1.5) * t + 0.3)
+            pad += 0.25 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 2.0) * t + 0.7)
+            pad += 0.125 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 2.5) * t + 1.1)
+            mod = 0.8 + 0.2 * np.sin(2 * np.pi * 0.1 * t)
+            layer5 = pad * mod * AMP_AMBIENT
 
-        n = 0
-        while n < total_frames:
-            frames = min(WRITE_CHUNK_FRAMES, total_frames - n)
-            buf = bytearray()
+            # Layer 6 breathing noise
+            noise = rng.normal(0.0, 1.0, size=cur_size).astype(np.float32)
+            filtered = np.convolve(noise, kernel, mode="same").astype(np.float32)
+            cycleB = np.mod(t, 5.0)
+            envB = np.zeros_like(t, dtype=np.float64)
+            inhale = cycleB < 2.0
+            envB[inhale] = np.sin(np.pi * cycleB[inhale] / 4.0) ** 2
+            exhale = ~inhale
+            envB[exhale] = np.cos(np.pi * (cycleB[exhale] - 2.0) / 6.0) ** 2
+            layer6 = (filtered.astype(np.float64) * envB) * AMP_BREATH
 
-            for i in range(frames):
-                t = (n + i) / SAMPLE_RATE
-                g = _fade_gain(n + i, total_frames, fade_frames)
+            mixed = layer1 + layer2 + layer3 + layer4 + layer5 + layer6
 
-                # base signal
-                y = 0.0
+            max_amp = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+            if max_amp > 0.95:
+                mixed = mixed * (0.95 / max_amp)
 
-                if kind == "sweep":
-                    # triangle sweep 0..1..0 over period
-                    u = (t % sweep_period) / sweep_period
-                    tri = 1.0 - abs(2.0 * u - 1.0)
-                    freq = f0 + (f1 - f0) * tri
-                    phase += (twopi * freq) / SAMPLE_RATE
-                    y += math.sin(phase) * base_amp
+            pcm = (mixed * 32767.0).astype(np.int16)
+            wf.writeframes(pcm.tobytes())
 
-                elif kind == "pulse":
-                    # pulse envelope
-                    if pulse_hz <= 0.0:
-                        env = 1.0
-                    else:
-                        u = (t * pulse_hz) % 1.0
-                        env = 1.0 if u < duty else 0.0
-                    phase += (twopi * tone_hz) / SAMPLE_RATE
-                    # soften edges a little (no heavy filter, just a smoothstep-ish)
-                    env = env * env * (3.0 - 2.0 * env)
-                    y += math.sin(phase) * base_amp * env
+            done = chunk_start + cur_size
+            pct = done / float(total_samples)
+            elapsed = int(time.time() - start_time)
+            step = steps[(c // 2) % len(steps)]
+            emit({"type": "build", "pct": pct, "step": step, "elapsed_s": elapsed})
 
-                elif kind == "chirp":
-                    every = float(preset.get("chirp_every_s", 1.5))
-                    clen = float(preset.get("chirp_len_s", 0.12))
-                    cf0 = float(preset.get("chirp_f0", 900.0))
-                    cf1 = float(preset.get("chirp_f1", 1800.0))
+    OUT_TMP.replace(OUT_WAV)
+    write_meta()
 
-                    if t >= chirp_next:
-                        chirp_next = t + every
 
-                    dt = t - (chirp_next - every)
-                    if 0.0 <= dt <= clen:
-                        u = dt / max(1e-6, clen)
-                        freq = cf0 + (cf1 - cf0) * u
-                        phase += (twopi * freq) / SAMPLE_RATE
-                        # fast fade in/out on the chirp itself
-                        chirp_env = math.sin(math.pi * u)
-                        y += math.sin(phase) * base_amp * chirp_env
-                    else:
-                        # quiet in-between (still a bit of baseline tone to avoid dead air)
-                        phase += (twopi * 220.0) / SAMPLE_RATE
-                        y += math.sin(phase) * (base_amp * 0.12)
-
-                elif kind == "drone":
-                    wob = (math.sin(twopi * wobble_hz * t) * 0.5 + 0.5)  # 0..1
-                    wob = 0.75 + 0.25 * wob
-                    for j, hz in enumerate(drone_tones):
-                        y += math.sin(twopi * hz * t + (j * 0.7)) * (base_amp / max(1, len(drone_tones))) * wob
-
-                elif kind == "hop":
-                    every = float(preset.get("hop_every_s", 1.0))
-                    lo, hi = preset.get("hop_band", (250.0, 1400.0))
-                    if t >= hop_next:
-                        hop_next = t + every
-                        hop_freq = rng.uniform(float(lo), float(hi))
-                    phase += (twopi * hop_freq) / SAMPLE_RATE
-                    y += math.sin(phase) * base_amp
-
-                else:
-                    # fallback simple tone + noise
-                    phase += (twopi * 432.0) / SAMPLE_RATE
-                    y += math.sin(phase) * base_amp
-
-                # noise floor
-                y += (rng.random() * 2.0 - 1.0) * noise_amp
-
-                # global fade to avoid clicks
-                y *= g
-
-                s = _clamp16(y)
-                buf += int(s).to_bytes(2, "little", signed=True)
-
-            wf.writeframes(buf)
-            n += frames
-
-    # Atomic replace
-    OUT_WAV_TMP.replace(path)
-    return duration_s
+def send_state() -> None:
+    emit({
+        "type": "state",
+        "ready": signature_is_ready(),
+        "playing": is_playing(),
+        "elapsed_s": playback_elapsed(),
+        "duration_s": DURATION_S,
+    })
 
 
 # -----------------------------
-# Input handling (stdin keys)
+# Button protocol (from app.py)
+# up, down, select, select_hold, back
 # -----------------------------
-sel = selectors.DefaultSelector()
-try:
-    sel.register(sys.stdin, selectors.EVENT_READ)
-except Exception:
-    pass
+def handle_cmd(cmd: str) -> None:
+    cmd = (cmd or "").strip().lower()
+    if not cmd:
+        return
 
+    if cmd == "select":
+        if is_playing():
+            stop_playback()
+        else:
+            start_playback_loop(OUT_WAV)
+        send_state()
+        return
 
-def read_key_nonblocking(timeout: float = 0.0) -> Optional[str]:
-    try:
-        events = sel.select(timeout)
-        if not events:
-            return None
-        data = sys.stdin.read(1)
-        if data == "":
-            return None
-        return data
-    except Exception:
-        return None
+    if cmd == "back":
+        stop_playback()
+        emit({"type": "exit"})
+        raise SystemExit(0)
+
+    if cmd == "select_hold":
+        # optional: rebuild signature on hold
+        stop_playback()
+        # force rebuild next time
+        try:
+            if OUT_WAV.exists():
+                OUT_WAV.unlink()
+            if META_JSON.exists():
+                META_JSON.unlink()
+        except Exception:
+            pass
+        emit({"type": "rebuild_requested"})
+        send_state()
+        return
+
+    # up/down currently unused (reserved for future)
+    if cmd in ("up", "down"):
+        emit({"type": "noop", "cmd": cmd})
+        return
+
+    emit({"type": "error", "message": f"Unknown cmd: {cmd}"})
 
 
 # -----------------------------
@@ -383,98 +328,47 @@ def read_key_nonblocking(timeout: float = 0.0) -> Optional[str]:
 def _sig_handler(signum, frame):
     global running
     running = False
-
+    stop_playback()
 
 signal.signal(signal.SIGINT, _sig_handler)
 signal.signal(signal.SIGTERM, _sig_handler)
 
 
-# -----------------------------
-# Main UX loop
-# -----------------------------
 def main():
-    global running
+    emit({"type": "hello", "module": "uap_caller", "version": SIGNATURE_VERSION})
 
-    preset_idx = 0
-    state = "IDLE"
-    last_anim = 0
-    wav_seed = None
-
-    # Preflight: ensure player exists early, so UX is clean
+    # Preflight player
     try:
-        _ = _pick_player()
+        _pick_player()
     except Exception as e:
-        oled_message("UAP Caller", ["Audio player missing", "Install aplay/paplay"], "Exit")
-        print(f"[uap_caller] ERROR: {e}", file=sys.stderr)
+        emit({"type": "fatal", "message": str(e)})
         return 2
 
-    oled_message("UAP Caller", ["Ready", "1-5 preset | Space run"], "q=quit")
-    time.sleep(0.4)
+    # Build on initial load
+    if not signature_is_ready():
+        emit({"type": "page", "name": "build"})
+        try:
+            build_uap3_signature()
+        except Exception as e:
+            emit({"type": "fatal", "message": f"Build failed: {e}"})
+            return 3
+
+    emit({"type": "page", "name": "playback"})
+    send_state()
 
     while running:
-        preset = PRESETS[preset_idx]
-        name = preset["name"]
-        subtitle = preset.get("subtitle", "")
-        key = read_key_nonblocking(0.05)
+        line = sys.stdin.readline()
+        if line == "":
+            break
+        try:
+            handle_cmd(line)
+        except SystemExit:
+            break
+        except Exception as e:
+            emit({"type": "error", "message": str(e)})
 
-        # Simple animated idle meter
-        last_anim += 1
-        idle_level = (math.sin(time.time() * 3.0) * 0.5 + 0.5) * 0.35
-
-        if state == "IDLE":
-            oled_status(name, subtitle, "IDLE  (select / start)", 0, last_anim, idle_level)
-
-        if key:
-            key = key.lower()
-
-            if key == "q":
-                running = False
-                break
-
-            if key in ["\n", "\r", " "]:  # start/stop
-                if state == "IDLE":
-                    state = "GENERATE"
-                else:
-                    # If you later make playback async, stop it here.
-                    state = "IDLE"
-
-            elif key == "n":
-                preset_idx = (preset_idx + 1) % len(PRESETS)
-
-            elif key in ["1", "2", "3", "4", "5"]:
-                preset_idx = int(key) - 1
-
-        if state == "GENERATE":
-            wav_seed = int(time.time() * 1000) & 0xFFFFFFFF
-            oled_status(name, subtitle, "Building signal…", 0, last_anim, 0.6)
-
-            try:
-                dur = generate_uap_wav(OUT_WAV, preset, seed=wav_seed)
-            except Exception as e:
-                oled_message("UAP Caller", ["Generate failed", str(e)[:21]], "Back")
-                time.sleep(1.2)
-                state = "IDLE"
-                continue
-
-            state = "PLAY"
-            t_end = time.time() + dur
-
-        if state == "PLAY":
-            # We do blocking playback, but keep OLED updated using a crude "phase meter".
-            # To keep it responsive, we *could* switch to Popen + polling; blocking keeps it most reliable.
-            # So: show a short countdown screen, then play.
-            remaining = max(0, int(t_end - time.time()))
-            oled_status(name, subtitle, "Playing…", remaining, last_anim, 0.8)
-            rc = play_wav_blocking(OUT_WAV)
-
-            if rc != 0:
-                oled_message("UAP Caller", ["Playback error", "Check audio output"], "Back")
-                time.sleep(1.2)
-
-            state = "IDLE"
-
-    oled_message("UAP Caller", ["Shutting down…"], "")
-    time.sleep(0.3)
+    stop_playback()
+    emit({"type": "exit"})
     return 0
 
 
