@@ -858,18 +858,17 @@ def run_module(mod: Module, consume, clear) -> None:
         )
 
     def pump_stdout() -> None:
-        # Read any available module output without blocking.
         for key, _ in out_sel.select(timeout=0):
             line = key.fileobj.readline()
             if not line:
                 return
-            # Optional: keep a copy in log
-            log(line.rstrip())
+
+            log("[child] " + line.rstrip())
 
             try:
                 msg = json.loads(line)
             except Exception:
-                return
+                continue  # <-- don't abort on non-JSON lines
 
             t = msg.get("type")
             if t == "page":
@@ -884,8 +883,8 @@ def run_module(mod: Module, consume, clear) -> None:
                 state["page"] = "fatal"
                 state["build_step"] = str(msg.get("message", "fatal"))[:21]
             elif t == "exit":
-                # module is exiting; let loop detect proc.poll()
                 pass
+
 
     # Run loop while module is alive
     while proc.poll() is None:
