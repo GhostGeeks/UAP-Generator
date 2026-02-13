@@ -775,8 +775,6 @@ def run_module(mod: Module, consume, clear) -> None:
     clear()
     drain_events(consume, seconds=0.20)
 
-    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
-
     # Use the current interpreter (systemd already launches app.py inside the venv)
     cmd = [sys.executable, mod.entry_path]
 
@@ -826,8 +824,80 @@ def run_module(mod: Module, consume, clear) -> None:
         except Exception:
             pass
 
+
+    # -----------------------------
+    # Module UI state (UAP Caller headless JSON stdout)
+    # app.py owns OLED; module emits JSON lines on stdout.
+    # -----------------------------
+    out_sel = selectors.DefaultSelector()
+    if proc.stdout:
+        out_sel.register(proc.stdout, selectors.EVENT_READ)
+
+    state = {
+        "page": "build",
+        "build_pct": 0.0,
+        "build_step": "",
+        "playing": False,
+        "elapsed_s": 0,
+    }
+
+    def draw_build() -> None:
+        oled_message(
+            "UAP Call Sig",
+            [state["build_step"], f"{int(state['build_pct']*100):3d}%"],
+            "Loading..."
+        )
+
+    def draw_playback() -> None:
+        mm, ss = divmod(int(state["elapsed_s"]), 60)
+        st = "PLAYING" if state["playing"] else "READY"
+        oled_message(
+            "UAP Caller",
+            [st, f"Time {mm:02d}:{ss:02d}"],
+            "SEL=Play  BACK"
+        )
+
+    def pump_stdout() -> None:
+        # Read any available module output without blocking.
+        for key, _ in out_sel.select(timeout=0):
+            line = key.fileobj.readline()
+            if not line:
+                return
+            # Optional: keep a copy in log
+            log(line.rstrip())
+
+            try:
+                msg = json.loads(line)
+            except Exception:
+                return
+
+            t = msg.get("type")
+            if t == "page":
+                state["page"] = msg.get("name", state["page"])
+            elif t == "build":
+                state["build_pct"] = float(msg.get("pct", state["build_pct"]))
+                state["build_step"] = str(msg.get("step", state["build_step"]))
+            elif t == "state":
+                state["playing"] = bool(msg.get("playing", state["playing"]))
+                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
+            elif t == "fatal":
+                state["page"] = "fatal"
+                state["build_step"] = str(msg.get("message", "fatal"))[:21]
+            elif t == "exit":
+                # module is exiting; let loop detect proc.poll()
+                pass
+
     # Run loop while module is alive
     while proc.poll() is None:
+        # Pump module stdout and render module UI
+        pump_stdout()
+        if state.get('page') == 'build':
+            draw_build()
+        elif state.get('page') == 'fatal':
+            oled_message('UAP Caller', ['ERROR', state.get('build_step','')], 'BACK')
+        else:
+            draw_playback()
+
         if consume("up"):
             send("up")
         if consume("down"):
@@ -884,63 +954,6 @@ def run_module(mod: Module, consume, clear) -> None:
 
     # Child may have left OLED off; recover here
     oled_hard_wake()
-
-# -----------------------------
-# Module UI state
-# -----------------------------
-out_sel = selectors.DefaultSelector()
-if proc.stdout:
-    out_sel.register(proc.stdout, selectors.EVENT_READ)
-
-page = "build"
-build_pct = 0.0
-build_step = ""
-playing = False
-elapsed_s = 0
-
-
-def draw_build():
-    oled_message(
-        "UAP Call Sig",
-        [build_step, f"{int(build_pct*100):3d}%"],
-        "Loading..."
-    )
-
-
-def draw_playback():
-    mm, ss = divmod(elapsed_s, 60)
-    st = "PLAYING" if playing else "READY"
-    oled_message(
-        "UAP Caller",
-        [st, f"Time {mm:02d}:{ss:02d}"],
-        "SEL=Play  BACK"
-    )
-
-
-def pump_stdout():
-    nonlocal page, build_pct, build_step, playing, elapsed_s
-
-    for key, _ in out_sel.select(timeout=0):
-        line = key.fileobj.readline()
-        if not line:
-            return
-        try:
-            msg = json.loads(line)
-        except Exception:
-            return
-
-        t = msg.get("type")
-
-        if t == "page":
-            page = msg.get("name", page)
-
-        elif t == "build":
-            build_pct = float(msg.get("pct", build_pct))
-            build_step = str(msg.get("step", build_step))
-
-        elif t == "state":
-            playing = bool(msg.get("playing", playing))
-            elapsed_s = int(msg.get("elapsed_s", elapsed_s))
 
 # =====================================================
 # MAIN
