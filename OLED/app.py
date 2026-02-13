@@ -771,12 +771,15 @@ def run_module(mod: Module, consume, clear) -> None:
     """
     ensure_dirs()
 
+    # Clear/drain BEFORE launch so stale BACK never gets forwarded.
     clear()
     drain_events(consume, seconds=0.20)
 
-    cmd = [sys.executable, mod.entry_path]
-    log_path = log_path_for(mod.id)
+    oled_message("RUNNING", [mod.name, mod.subtitle], "BACK = exit")
 
+    cmd = [sys.executable, mod.entry_path]
+
+    log_path = log_path_for(mod.id)
     try:
         logf = open(log_path, "w", buffering=1)
     except Exception:
@@ -803,8 +806,8 @@ def run_module(mod: Module, consume, clear) -> None:
             bufsize=1,
         )
     except Exception as e:
-        log(f"[launcher] failed_to_start: {e!r}")
         if logf:
+            log(f"[launcher] failed_to_start: {e!r}")
             try:
                 logf.close()
             except Exception:
@@ -824,9 +827,12 @@ def run_module(mod: Module, consume, clear) -> None:
             pass
 
     # -----------------------------
-    # UAP Caller: app owns OLED; module emits JSON status on stdout
+    # UAP Caller JSON UI path
     # -----------------------------
     if is_uap:
+        # Ensure these imports exist at top of app.py:
+        # import json
+        # import selectors
         out_sel = selectors.DefaultSelector()
         if proc.stdout:
             out_sel.register(proc.stdout, selectors.EVENT_READ)
@@ -851,43 +857,47 @@ def run_module(mod: Module, consume, clear) -> None:
             st = "PLAYING" if state["playing"] else "READY"
             oled_message("UAP Caller", [st, f"Time {mm:02d}:{ss:02d}"], "SEL=Play BACK")
 
-        def pump_stdout() -> None:
-            # Drain EVERYTHING available; never stop on non-JSON lines.
-            for key, _ in out_sel.select(timeout=0):
-                while True:
-                    try:
-                        line = key.fileobj.readline()
-                    except Exception:
-                        return
-                    if not line:
-                        return
+        def pump_stdout_once() -> None:
+            # Read at most ONE line per tick. Never loop/never block the UI.
+            events = out_sel.select(timeout=0)
+            if not events:
+                return
+            if not proc.stdout:
+                return
 
-                    log(f"[child] {line.rstrip()}")
+            try:
+                line = proc.stdout.readline()
+            except Exception:
+                return
+            if not line:
+                return
 
-                    try:
-                        msg = json.loads(line)
-                    except Exception:
-                        # Not JSON? ignore and keep draining.
-                        continue
+            log(f"[child] {line.rstrip()}")
 
-                    t = msg.get("type")
-                    if t == "page":
-                        state["page"] = msg.get("name", state["page"])
-                    elif t == "build":
-                        state["build_pct"] = float(msg.get("pct", state["build_pct"]))
-                        state["build_step"] = str(msg.get("step", state["build_step"]))
-                        state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
-                    elif t == "state":
-                        state["playing"] = bool(msg.get("playing", state["playing"]))
-                        state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
-                    elif t == "fatal":
-                        state["page"] = "fatal"
-                        state["build_step"] = str(msg.get("message", "fatal"))[:21]
-                    elif t == "exit":
-                        pass
+            try:
+                msg = json.loads(line)
+            except Exception:
+                # Ignore non-JSON lines; DO NOT freeze.
+                return
+
+            t = msg.get("type")
+            if t == "page":
+                state["page"] = msg.get("name", state["page"])
+            elif t == "build":
+                state["build_pct"] = float(msg.get("pct", state["build_pct"]))
+                state["build_step"] = str(msg.get("step", state["build_step"]))
+                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
+            elif t == "state":
+                state["playing"] = bool(msg.get("playing", state["playing"]))
+                state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
+            elif t == "fatal":
+                state["page"] = "fatal"
+                state["build_step"] = str(msg.get("message", "fatal"))[:21]
+            elif t == "exit":
+                pass
 
         while proc.poll() is None:
-            pump_stdout()
+            pump_stdout_once()
 
             if state.get("page") == "build":
                 draw_build()
@@ -907,6 +917,7 @@ def run_module(mod: Module, consume, clear) -> None:
 
             if consume("back"):
                 send("back")
+                # give it a moment to exit cleanly
                 for _ in range(40):
                     if proc.poll() is not None:
                         break
@@ -931,7 +942,7 @@ def run_module(mod: Module, consume, clear) -> None:
             pass
 
     # -----------------------------
-    # Default modules: classic runner
+    # Normal modules path
     # -----------------------------
     else:
         while proc.poll() is None:
@@ -959,12 +970,14 @@ def run_module(mod: Module, consume, clear) -> None:
 
             time.sleep(0.02)
 
+    # cleanup stdin
     try:
         if proc.stdin:
             proc.stdin.close()
     except Exception:
         pass
 
+    # wait a bit; force kill if needed
     try:
         proc.wait(timeout=1.0)
     except Exception:
@@ -981,8 +994,11 @@ def run_module(mod: Module, consume, clear) -> None:
         except Exception:
             pass
 
+    # Clear and drain AGAIN after return
     clear()
     drain_events(consume, seconds=0.30)
+
+    # Child may have left OLED off; recover here
     oled_hard_wake()
 
 # =====================================================

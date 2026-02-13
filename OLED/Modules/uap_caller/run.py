@@ -31,6 +31,7 @@ SAMPWIDTH_BYTES = 2
 DEFAULT_DURATION_S = 180  # looped signature
 DURATION_S = int(os.environ.get("UAP_DURATION_S", str(DEFAULT_DURATION_S)))
 
+# Crafted layer constants
 SCHUMANN_FREQ = 7.83
 CARRIER_FREQ = 100.0
 HARMONIC_BASE_FREQ = 528.0
@@ -44,9 +45,11 @@ AMP_AMBIENT = 0.20
 AMP_BREATH = 0.15
 
 BREATH_SEED = 1337
+
+# Smaller chunk for frequent UI updates (prevents "stalled" look)
 CHUNK_SECONDS = 1
 
-SIGNATURE_VERSION = "uap3_signature_v4_headless"
+SIGNATURE_VERSION = "uap3_signature_v5_headless_safe"
 
 running = True
 play_proc: Optional[subprocess.Popen] = None
@@ -110,7 +113,7 @@ def start_playback_loop(path: Path) -> None:
             stderr=subprocess.DEVNULL,
         )
     else:
-        # paplay doesn't loop; app can re-trigger, but we keep it simple for now
+        # paplay doesn't loop; keep simple
         play_proc = subprocess.Popen(
             player + [str(path)],
             stdout=subprocess.DEVNULL,
@@ -159,7 +162,7 @@ def build_uap3_signature() -> None:
     try:
         import numpy as np
     except Exception as e:
-        raise RuntimeError("numpy missing (install python3-numpy)") from e
+        raise RuntimeError("numpy missing in venv (pip install numpy)") from e
 
     total_samples = int(DURATION_S * SAMPLE_RATE)
     chunk_size = int(CHUNK_SECONDS * SAMPLE_RATE)
@@ -168,21 +171,21 @@ def build_uap3_signature() -> None:
 
     rng = np.random.default_rng(BREATH_SEED)
 
-    # FAST smoothing for breathing noise (O(n))
+    # Moving average smoothing (O(n)), float32 throughout
     klen = 64
 
-    def moving_average_same(x, win):
-        """Moving average returning same-length output (len(y) == len(x))."""
+    def moving_average_same(x_f32, win: int):
         if win <= 1:
-            return x.astype(np.float32, copy=False)
+            return x_f32
         pad_left = win // 2
         pad_right = win - 1 - pad_left
-        xpad = np.pad(x, (pad_left, pad_right), mode="edge").astype(np.float64, copy=False)
+        xpad = np.pad(x_f32, (pad_left, pad_right), mode="edge").astype(np.float64, copy=False)
         c = np.cumsum(np.concatenate(([0.0], xpad)), dtype=np.float64)
-        y = (c[win:] - c[:-win]) / float(win)  # length == len(x)
+        y = (c[win:] - c[:-win]) / float(win)  # len == len(x)
         return y.astype(np.float32, copy=False)
 
     steps = [
+        "Allocating spectrum",
         "Installing harmonics",
         "Tuning resonance",
         "Calibrating pings",
@@ -191,6 +194,13 @@ def build_uap3_signature() -> None:
         "Final mixdown",
         "Normalizing output",
     ]
+
+    # Ensure stale tmp doesn't confuse us
+    try:
+        if OUT_TMP.exists():
+            OUT_TMP.unlink()
+    except Exception:
+        pass
 
     start_time = time.time()
 
@@ -205,39 +215,43 @@ def build_uap3_signature() -> None:
             cur_size = remainder if (c == chunks and remainder) else chunk_size
             chunk_start = c * chunk_size
             t0 = chunk_start / SAMPLE_RATE
+
+            # Time vector float32 is fine; use float64 for sin math only where needed
             t = (np.arange(cur_size, dtype=np.float64) / SAMPLE_RATE) + t0
 
-            # UI heartbeat at chunk start (prevents "frozen" perception)
-            step = steps[(c // 2) % len(steps)]
-            emit({
-                "type": "build",
-                "pct": chunk_start / float(total_samples),
-                "step": step,
-                "elapsed_s": int(time.time() - start_time),
-            })
+            step = steps[min(len(steps) - 1, (c * len(steps)) // max(1, total_parts))]
+            emit(
+                {
+                    "type": "build",
+                    "pct": chunk_start / float(total_samples),
+                    "step": step,
+                    "elapsed_s": int(time.time() - start_time),
+                }
+            )
 
-            # Layer 1
+            # Layer 1: Schumann AM on 100Hz carrier
             carrier = np.sin(2 * np.pi * CARRIER_FREQ * t)
             modulator = 0.5 * (1.0 + np.sin(2 * np.pi * SCHUMANN_FREQ * t))
-            layer1 = modulator * carrier * AMP_SCHUMANN
+            layer1 = (modulator * carrier * AMP_SCHUMANN).astype(np.float64, copy=False)
 
-            # Layer 2
+            # Layer 2: 528Hz + harmonics
             sig = np.sin(2 * np.pi * HARMONIC_BASE_FREQ * t)
             sig += 0.3 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 2.0) * t)
             sig += 0.1 * np.sin(2 * np.pi * (HARMONIC_BASE_FREQ * 3.0) * t)
             wobble = 1.0 + 0.001 * np.sin(2 * np.pi * 0.1 * t)
-            layer2 = sig * wobble * AMP_HARMONIC
+            layer2 = (sig * wobble * AMP_HARMONIC).astype(np.float64, copy=False)
 
-            # Layer 3
+            # Layer 3: 17kHz pings every 5s
             ping_freq = 17000.0
             ping_dur = 0.1
             cycle5 = np.mod(t, 5.0)
             ping_mask = cycle5 < ping_dur
             ping_env = np.zeros_like(t, dtype=np.float64)
-            ping_env[ping_mask] = np.sin(np.pi * (cycle5[ping_mask] / ping_dur)) ** 2
-            layer3 = np.sin(2 * np.pi * ping_freq * t) * ping_env * AMP_PING
+            if np.any(ping_mask):
+                ping_env[ping_mask] = np.sin(np.pi * (cycle5[ping_mask] / ping_dur)) ** 2
+            layer3 = (np.sin(2 * np.pi * ping_freq * t) * ping_env * AMP_PING).astype(np.float64, copy=False)
 
-            # Layer 4
+            # Layer 4: chirps every 10s (2k->3k over 0.2s)
             chirp_dur = 0.2
             cycle10 = np.mod(t, 10.0)
             chirp_mask = cycle10 < chirp_dur
@@ -250,26 +264,25 @@ def build_uap3_signature() -> None:
                 phase = 2 * np.pi * (f0 * tr + 0.5 * k * tr * tr)
                 env = np.sin(np.pi * (tr / chirp_dur)) ** 2
                 chirp[chirp_mask] = np.sin(phase) * env
-            layer4 = chirp * AMP_CHIRP
+            layer4 = (chirp * AMP_CHIRP).astype(np.float64, copy=False)
 
-            # Layer 5
+            # Layer 5: ambient pad 432Hz with harmonics
             pad = np.sin(2 * np.pi * AMBIENT_BASE_FREQ * t)
             pad += 0.5 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 1.5) * t + 0.3)
             pad += 0.25 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 2.0) * t + 0.7)
             pad += 0.125 * np.sin(2 * np.pi * (AMBIENT_BASE_FREQ * 2.5) * t + 1.1)
             mod = 0.8 + 0.2 * np.sin(2 * np.pi * 0.1 * t)
-            layer5 = pad * mod * AMP_AMBIENT
+            layer5 = (pad * mod * AMP_AMBIENT).astype(np.float64, copy=False)
 
-            # Layer 6
-            noise = rng.normal(0.0, 1.0, size=cur_size).astype(np.float32)
-            filtered = moving_average_same(noise, klen)
+            # Layer 6: breathing noise (deterministic)
+            noise = rng.normal(0.0, 1.0, size=cur_size).astype(np.float32, copy=False)
+            filtered = moving_average_same(noise, klen)  # float32
             cycleB = np.mod(t, 5.0)
             envB = np.zeros_like(t, dtype=np.float64)
             inhale = cycleB < 2.0
             envB[inhale] = np.sin(np.pi * cycleB[inhale] / 4.0) ** 2
-            exhale = ~inhale
-            envB[exhale] = np.cos(np.pi * (cycleB[exhale] - 2.0) / 6.0) ** 2
-            layer6 = (filtered.astype(np.float64) * envB) * AMP_BREATH
+            envB[~inhale] = np.cos(np.pi * (cycleB[~inhale] - 2.0) / 6.0) ** 2
+            layer6 = (filtered.astype(np.float64, copy=False) * envB * AMP_BREATH).astype(np.float64, copy=False)
 
             mixed = layer1 + layer2 + layer3 + layer4 + layer5 + layer6
 
@@ -277,19 +290,22 @@ def build_uap3_signature() -> None:
             if max_amp > 0.95:
                 mixed = mixed * (0.95 / max_amp)
 
-            pcm = (mixed * 32767.0).astype(np.int16)
+            pcm = (mixed * 32767.0).astype(np.int16, copy=False)
             wf.writeframes(pcm.tobytes())
 
             done = chunk_start + cur_size
-            emit({
-                "type": "build",
-                "pct": done / float(total_samples),
-                "step": step,
-                "elapsed_s": int(time.time() - start_time),
-            })
+            emit(
+                {
+                    "type": "build",
+                    "pct": done / float(total_samples),
+                    "step": step,
+                    "elapsed_s": int(time.time() - start_time),
+                }
+            )
 
     OUT_TMP.replace(OUT_WAV)
     write_meta()
+
 
 def send_state() -> None:
     emit(
@@ -304,7 +320,7 @@ def send_state() -> None:
 
 
 # -----------------------------
-# Button protocol (from app.py)
+# Button protocol from app.py
 # up, down, select, select_hold, back
 # -----------------------------
 def handle_cmd(cmd: str) -> None:
@@ -323,32 +339,37 @@ def handle_cmd(cmd: str) -> None:
         send_state()
         return
 
-    if cmd == "back":
-        stop_playback()
-        emit({"type": "exit"})
-        raise SystemExit(0)
-
     if cmd == "select_hold":
+        # Rebuild signature
         stop_playback()
         try:
             if OUT_WAV.exists():
                 OUT_WAV.unlink()
             if META_JSON.exists():
                 META_JSON.unlink()
+            if OUT_TMP.exists():
+                OUT_TMP.unlink()
         except Exception:
             pass
+
         emit({"type": "page", "name": "build"})
         try:
             build_uap3_signature()
         except Exception as e:
             emit({"type": "fatal", "message": f"Build failed: {e}"})
             return
+
         emit({"type": "page", "name": "playback"})
         send_state()
         return
 
+    if cmd == "back":
+        stop_playback()
+        emit({"type": "exit"})
+        raise SystemExit(0)
+
+    # ignore up/down for now
     if cmd in ("up", "down"):
-        emit({"type": "noop", "cmd": cmd})
         return
 
     emit({"type": "error", "message": f"Unknown cmd: {cmd}"})
@@ -367,7 +388,7 @@ signal.signal(signal.SIGINT, _sig_handler)
 signal.signal(signal.SIGTERM, _sig_handler)
 
 
-def main():
+def main() -> int:
     emit({"type": "hello", "module": "uap_caller", "version": SIGNATURE_VERSION})
 
     # Preflight player
@@ -407,3 +428,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
