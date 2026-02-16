@@ -25,7 +25,7 @@ OUT_TMP = CACHE_DIR / "uap3_signature.wav.tmp"
 META_JSON = CACHE_DIR / "uap3_signature.meta.json"
 
 # -----------------------------
-# Audio config (Pi Zero 2W safe)
+# Audio config
 # -----------------------------
 SAMPLE_RATE = 44100
 CHANNELS = 1
@@ -49,9 +49,8 @@ AMP_BREATH = 0.15
 BREATH_SEED = 1337
 CHUNK_SECONDS = float(os.environ.get("UAP_CHUNK_S", "0.75"))
 
-SIGNATURE_VERSION = "uap3_signature_v8_hardexit"
+SIGNATURE_VERSION = "uap3_signature_v9_heartbeat_hardexit"
 
-running = True
 stop_now = threading.Event()
 
 play_proc: Optional[subprocess.Popen] = None
@@ -76,19 +75,14 @@ def emit(obj: dict) -> None:
 
 
 def _hard_exit(code: int = 0) -> None:
-    """
-    Last-resort exit that cannot hang.
-    Must remain JSON-only before exit.
-    """
     try:
         emit({"type": "exit"})
     finally:
-        # Immediate process termination; avoids hangs in native code / stuck threads.
         os._exit(code)
 
 
 # -----------------------------
-# Playback (no BT management)
+# Playback
 # -----------------------------
 def _pick_player():
     if shutil.which("aplay"):
@@ -127,7 +121,6 @@ def start_playback_loop(path: Path) -> None:
     global play_proc, started_at
     stop_playback()
     player = _pick_player()
-
     if "aplay" in player[0]:
         play_proc = subprocess.Popen(
             player + ["--loop=0", str(path)],
@@ -187,20 +180,19 @@ def _safe_unlink(p: Path) -> None:
 # -----------------------------
 # Build (threaded + cancelable)
 # -----------------------------
+def _set_building(v: bool) -> None:
+    global _building
+    with _build_lock:
+        _building = v
+
+
 def _throttled_build_emit(pct: float, step: str, start_time: float, force: bool = False) -> None:
     global _last_build_progress_emit
     now = time.time()
     if (not force) and (now - _last_build_progress_emit) < 0.10:
         return
     _last_build_progress_emit = now
-    emit(
-        {
-            "type": "build",
-            "pct": max(0.0, min(1.0, float(pct))),
-            "step": str(step),
-            "elapsed_s": int(now - start_time),
-        }
-    )
+    emit({"type": "build", "pct": max(0.0, min(1.0, float(pct))), "step": str(step), "elapsed_s": int(now - start_time)})
 
 
 def build_uap_signature(cancel_evt: threading.Event) -> None:
@@ -337,28 +329,8 @@ def build_uap_signature(cancel_evt: threading.Event) -> None:
     _throttled_build_emit(1.0, "Build complete", start_time, force=True)
 
 
-def send_state() -> None:
-    emit(
-        {
-            "type": "state",
-            "ready": signature_is_ready(),
-            "playing": is_playing(),
-            "elapsed_s": playback_elapsed(),
-            "duration_s": DURATION_S,
-            "building": _building,
-        }
-    )
-
-
-def _set_building(val: bool) -> None:
-    global _building
-    with _build_lock:
-        _building = val
-
-
 def start_build_async(force_rebuild: bool) -> None:
     global _build_thread
-
     with _build_lock:
         if _build_thread is not None and _build_thread.is_alive():
             return
@@ -384,12 +356,32 @@ def start_build_async(force_rebuild: bool) -> None:
                 _set_building(False)
                 if signature_is_ready() and not (stop_now.is_set() or _build_cancel.is_set()):
                     emit({"type": "page", "name": "playback"})
-                    send_state()
 
         _build_thread = threading.Thread(target=_runner, name="uap_build", daemon=True)
         _build_thread.start()
 
 
+# -----------------------------
+# Heartbeat (prevents “silent child”)
+# -----------------------------
+def _heartbeat():
+    while not stop_now.is_set():
+        emit(
+            {
+                "type": "state",
+                "ready": signature_is_ready(),
+                "playing": is_playing(),
+                "elapsed_s": playback_elapsed(),
+                "duration_s": DURATION_S,
+                "building": _building,
+            }
+        )
+        time.sleep(0.25)
+
+
+# -----------------------------
+# Commands
+# -----------------------------
 def handle_cmd(cmd: str) -> None:
     cmd = (cmd or "").strip().lower()
     if not cmd:
@@ -397,7 +389,6 @@ def handle_cmd(cmd: str) -> None:
 
     if cmd == "select":
         if _building:
-            send_state()
             return
         if is_playing():
             stop_playback()
@@ -406,7 +397,6 @@ def handle_cmd(cmd: str) -> None:
                 emit({"type": "fatal", "message": "Signature not ready"})
                 return
             start_playback_loop(OUT_WAV)
-        send_state()
         return
 
     if cmd == "select_hold":
@@ -416,14 +406,13 @@ def handle_cmd(cmd: str) -> None:
     if cmd == "back":
         _build_cancel.set()
         stop_playback()
-        # Make exit deterministic
         _hard_exit(0)
 
+    # up/down ignored
     return
 
 
-def _sig_handler(signum, frame):
-    # Make termination deterministic under timeout/systemd
+def _sig_handler(_signum, _frame):
     stop_now.set()
     _build_cancel.set()
     stop_playback()
@@ -437,32 +426,31 @@ signal.signal(signal.SIGTERM, _sig_handler)
 def main() -> int:
     emit({"type": "hello", "module": "uap_caller", "version": SIGNATURE_VERSION})
 
+    # Start heartbeat immediately so launcher never sees “hello then silence”
+    threading.Thread(target=_heartbeat, name="uap_heartbeat", daemon=True).start()
+
+    # Emit an initial page immediately (diagnostic + UX)
+    emit({"type": "page", "name": "build" if not signature_is_ready() else "playback"})
+
+    # Player preflight (fatal if missing)
     try:
         _pick_player()
     except Exception as e:
         emit({"type": "fatal", "message": str(e)})
         _hard_exit(2)
 
+    # Start build if needed
     if not signature_is_ready():
         start_build_async(force_rebuild=False)
-    else:
-        emit({"type": "page", "name": "playback"})
-        send_state()
 
+    # Non-blocking stdin loop
     sel = selectors.DefaultSelector()
     fd = sys.stdin.fileno()
     os.set_blocking(fd, False)
     sel.register(fd, selectors.EVENT_READ)
-
     buf = bytearray()
-    last_state_emit = 0.0
 
     while not stop_now.is_set():
-        now = time.time()
-        if (now - last_state_emit) >= 0.25:
-            send_state()
-            last_state_emit = now
-
         events = sel.select(timeout=0.1)
         if not events:
             continue
@@ -470,7 +458,6 @@ def main() -> int:
         for key, _mask in events:
             if key.fd != fd:
                 continue
-
             try:
                 chunk = os.read(fd, 4096)
             except BlockingIOError:
