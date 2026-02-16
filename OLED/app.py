@@ -756,6 +756,7 @@ def run_module(mod: Module, consume, clear) -> None:
     Special JSON stdout UI paths:
       - uap_caller
       - noise_generator
+      - tone_generator   <-- NEW
 
     All other modules remain legacy (stdin forwarding only; stdout->log/devnull).
     """
@@ -786,7 +787,8 @@ def run_module(mod: Module, consume, clear) -> None:
 
     is_uap = (mod.id == "uap_caller")
     is_noise = (mod.id == "noise_generator")
-    is_json_ui = is_uap or is_noise
+    is_tone = (mod.id == "tone_generator")  # NEW
+    is_json_ui = is_uap or is_noise or is_tone  # NEW
 
     # Start child
     try:
@@ -840,7 +842,6 @@ def run_module(mod: Module, consume, clear) -> None:
             oled_hard_wake()
             return
 
-        # UAP UI state
         state: Dict[str, Any] = {
             "page": "build",
             "build_pct": 0.0,
@@ -870,9 +871,7 @@ def run_module(mod: Module, consume, clear) -> None:
             msg = (str(state.get("fatal") or "Unknown error"))[:21]
             oled_message("UAP Caller", ["ERROR", msg, ""], "BACK")
 
-        # Main module loop
         while proc.poll() is None:
-            # 1) Drain stdout fast enough to prevent pipe fill
             msgs = pump.pump(max_bytes=65536, max_lines=80)
             if msgs:
                 last_msg_time = time.time()
@@ -882,13 +881,11 @@ def run_module(mod: Module, consume, clear) -> None:
                 if t == "page":
                     state["page"] = msg.get("name", state["page"])
                 elif t == "build":
-                    # pct can be 0..1
                     try:
                         state["build_pct"] = float(msg.get("pct", state["build_pct"]))
                     except Exception:
                         pass
                     state["build_step"] = str(msg.get("step", state["build_step"]))
-                    # optional
                     if "elapsed_s" in msg:
                         try:
                             state["elapsed_s"] = int(msg.get("elapsed_s", state["elapsed_s"]))
@@ -909,20 +906,15 @@ def run_module(mod: Module, consume, clear) -> None:
                     state["page"] = "fatal"
                     state["fatal"] = str(msg.get("message", "fatal"))
                 elif t == "exit":
-                    # child requests exit; break after it actually exits or shortly
                     pass
-                # ignore hello/error etc (optional)
 
-            # 2) UI watchdog: if build page and no messages for too long, show “alive”
             now = time.time()
             silent_s = now - last_msg_time
             if state.get("page") == "build" and silent_s > 2.5:
-                # do not change pct; just show the last step with a spinner-ish cue
                 step = str(state.get("build_step") or "Working")
                 if not step.endswith("."):
                     state["build_step"] = (step[:18] + "...")
 
-            # 3) Draw at a sane rate (avoid wasting CPU)
             if (now - last_draw_time) >= 0.08:
                 if state.get("page") == "fatal":
                     draw_fatal()
@@ -932,7 +924,6 @@ def run_module(mod: Module, consume, clear) -> None:
                     draw_playback()
                 last_draw_time = now
 
-            # 4) Forward buttons
             if consume("up"):
                 send("up")
             if consume("down"):
@@ -944,7 +935,6 @@ def run_module(mod: Module, consume, clear) -> None:
 
             if consume("back"):
                 send("back")
-                # give it a moment to exit cleanly
                 for _ in range(40):
                     if proc.poll() is not None:
                         break
@@ -956,8 +946,6 @@ def run_module(mod: Module, consume, clear) -> None:
                         pass
                 break
 
-            # 5) Hard watchdog: if child goes totally silent too long, fail safe
-            # (prevents infinite hung child from trapping UI)
             if silent_s > 30.0:
                 log("[launcher] watchdog: child silent >30s; terminating")
                 try:
@@ -968,7 +956,6 @@ def run_module(mod: Module, consume, clear) -> None:
 
             time.sleep(0.02)
 
-        # Cleanup pump/stdout
         try:
             if pump:
                 pump.close()
@@ -995,15 +982,13 @@ def run_module(mod: Module, consume, clear) -> None:
             oled_hard_wake()
             return
 
-        # Noise UI state (fed by child JSON)
         state: Dict[str, Any] = {
             "page": "main",
             "ready": False,
-            "noise_type": "white",
-            "pulse_ms": 200,
-            "volume": 70,
+            "mode": "white",
             "playing": False,
-            "cursor": "noise",  # noise | rate | volume | play
+            "volume": 70,
+            "loop": True,
             "fatal": "",
             "toast": "",
             "toast_until": 0.0,
@@ -1016,66 +1001,34 @@ def run_module(mod: Module, consume, clear) -> None:
             m = (m or "").strip().lower()
             if not m:
                 return "White"
-            # Title-case common types
             return m[:1].upper() + m[1:]
 
         def draw_noise_main() -> None:
-            noise_raw = str(state.get("noise_type") or "white").strip().lower()
-            if noise_raw == "white":
-                noise_disp = "White"
-            elif noise_raw == "pink":
-                noise_disp = "Pink"
-            elif noise_raw == "brown":
-                noise_disp = "Brown"
-            else:
-                noise_disp = (noise_raw[:1].upper() + noise_raw[1:]) if noise_raw else "White"
-
-            pulse_ms = int(state.get("pulse_ms") or 200)
+            mode = _norm_mode(str(state.get("mode") or "white"))
+            playing = bool(state.get("playing"))
             vol = int(state.get("volume") or 0)
             vol = max(0, min(100, vol))
-            playing = bool(state.get("playing"))
-            cursor = str(state.get("cursor") or "noise")
+            loop = bool(state.get("loop", True))
 
-            # toast
+            status = "PLAY" if playing else "STOP"
+            loop_s = "LOOP" if loop else "ONCE"
+
             now = time.time()
             toast = ""
             if state.get("toast") and now < float(state.get("toast_until") or 0.0):
                 toast = str(state.get("toast") or "")[:21]
 
-            items = [
-                ("noise",  f"Noise Type: {noise_disp}"),
-                ("rate",   f"Sweep Rate: {pulse_ms}ms"),
-                ("volume", f"Volume:     {vol}%"),
-                ("play",   f"Play:       {'STOP' if playing else 'PLAY'}"),
-            ]
+            line1 = f"MODE {mode}"[:21]
+            line2 = toast if toast else f"{status}  VOL {vol:3d}"[:21]
+            line3 = f"{loop_s}"[:21]
 
-            idx = 0
-            for i, (k, _) in enumerate(items):
-                if k == cursor:
-                    idx = i
-                    break
-
-            start = 0 if idx < 3 else 1
-            view = items[start:start+3]
-
-            lines = []
-            for k, text in view:
-                prefix = ">" if k == cursor else " "
-                lines.append((prefix + text)[:21])
-
-            # If toast is active, replace ONLY the 3rd line, but still only draw once
-            if toast:
-                lines[2] = toast[:21]
-
-            oled_message("Noise Generator", lines, "UP/DN=Move SEL=Set")
+            oled_message("Noise Generator", [line1, line2, line3], "SEL=Play HOLD=Adj BACK")
 
         def draw_noise_fatal() -> None:
             msg = (str(state.get("fatal") or "Unknown error"))[:21]
             oled_message("Noise Gen", ["ERROR", msg, ""], "BACK")
 
-        # Main module loop
         while proc.poll() is None:
-            # 1) Drain stdout fast enough to prevent pipe fill
             msgs = pump.pump(max_bytes=65536, max_lines=120)
             if msgs:
                 last_msg_time = time.time()
@@ -1091,22 +1044,17 @@ def run_module(mod: Module, consume, clear) -> None:
                 elif t == "state":
                     if "ready" in msg:
                         state["ready"] = bool(msg.get("ready"))
-                    if "noise_type" in msg:
-                        state["noise_type"] = str(msg.get("noise_type") or state.get("noise_type") or "white")
-                    if "pulse_ms" in msg:
-                        try:
-                            state["pulse_ms"] = int(msg.get("pulse_ms"))
-                        except Exception:
-                            pass
+                    if "mode" in msg:
+                        state["mode"] = str(msg.get("mode") or state.get("mode") or "white")
+                    if "playing" in msg:
+                        state["playing"] = bool(msg.get("playing"))
                     if "volume" in msg:
                         try:
                             state["volume"] = int(msg.get("volume"))
                         except Exception:
                             pass
-                    if "playing" in msg:
-                        state["playing"] = bool(msg.get("playing"))
-                    if "cursor" in msg:
-                        state["cursor"] = str(msg.get("cursor") or state.get("cursor") or "noise")
+                    if "loop" in msg:
+                        state["loop"] = bool(msg.get("loop"))
 
                 elif t == "toast":
                     txt = str(msg.get("message") or "")[:21]
@@ -1121,12 +1069,9 @@ def run_module(mod: Module, consume, clear) -> None:
                 elif t == "exit":
                     exit_requested = True
 
-                # hello/other types ignored safely
-
             now = time.time()
             silent_s = now - last_msg_time
 
-            # 2) Draw at a sane rate (avoid wasting CPU)
             if (now - last_draw_time) >= 0.08:
                 if state.get("page") == "fatal":
                     draw_noise_fatal()
@@ -1134,9 +1079,7 @@ def run_module(mod: Module, consume, clear) -> None:
                     draw_noise_main()
                 last_draw_time = now
 
-            # If child asked to exit, break once it actually exits (or we bail shortly)
             if exit_requested:
-                # give a brief chance to end naturally
                 for _ in range(25):
                     if proc.poll() is not None:
                         break
@@ -1144,7 +1087,6 @@ def run_module(mod: Module, consume, clear) -> None:
                 if proc.poll() is not None:
                     break
 
-            # 3) Forward buttons
             if consume("up"):
                 send("up")
             if consume("down"):
@@ -1155,7 +1097,6 @@ def run_module(mod: Module, consume, clear) -> None:
                 send("select_hold")
 
             if consume("back"):
-                # back must exit immediately; module should stop playback and exit.
                 send("back")
                 for _ in range(50):
                     if proc.poll() is not None:
@@ -1168,8 +1109,6 @@ def run_module(mod: Module, consume, clear) -> None:
                         pass
                 break
 
-            # 4) Hard watchdog: if child goes totally silent too long, fail safe
-            # Noise module is required to heartbeat; if it doesn't, assume hung.
             if silent_s > 15.0:
                 log("[launcher] watchdog: noise_generator silent >15s; terminating")
                 try:
@@ -1180,7 +1119,215 @@ def run_module(mod: Module, consume, clear) -> None:
 
             time.sleep(0.02)
 
-        # Cleanup pump/stdout
+        try:
+            if pump:
+                pump.close()
+        except Exception:
+            pass
+
+    # -----------------------------
+    # Tone Generator JSON UI path (NEW)
+    # -----------------------------
+    elif is_tone:
+        pump = None
+        try:
+            if proc.stdout is None:
+                raise RuntimeError("tone_generator requires stdout=PIPE")
+            pump = StdoutJSONPump(proc.stdout, log)
+        except Exception as e:
+            log(f"[launcher] pump_init_failed: {e!r}")
+            oled_message("Tone Generator", ["Pump init failed", str(e)[:21], ""], "BACK")
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            time.sleep(1.0)
+            oled_hard_wake()
+            return
+
+        # UI state fed by child JSON
+        state: Dict[str, Any] = {
+            "page": "main",
+            "ready": False,
+            "tone_type": "sine",
+            "freq_hz": 440,
+            "volume": 70,
+            "pulse_ms": 200,
+            "playing": False,
+            "cursor": "freq",
+            "fatal": "",
+            "toast": "",
+            "toast_until": 0.0,
+        }
+
+        last_msg_time = time.time()
+        last_draw_time = 0.0
+
+        def _text_w_px(s: str) -> int:
+            return len(s) * 6
+
+        def _draw_header(draw, title: str, status: str = ""):
+            draw.text((2, 0), title[:21], fill=255)
+            if status:
+                s = status[:6]
+                x = max(0, OLED_W - _text_w_px(s) - 2)
+                draw.text((x, 0), s, fill=255)
+            draw.line((0, 12, 127, 12), fill=255)
+
+        def _draw_footer(draw, text: str):
+            draw.line((0, 52, 127, 52), fill=255)
+            draw.text((2, 54), text[:21], fill=255)
+
+        def _draw_row(draw, y: int, text: str, selected: bool):
+            marker = ">" if selected else " "
+            draw.text((0, y), marker, fill=255)
+            draw.text((10, y), text[:19], fill=255)
+
+        def _rows_from_state():
+            tone = str(state.get("tone_type") or "sine")
+            freq = int(state.get("freq_hz") or 440)
+            pulse = int(state.get("pulse_ms") or 200)
+            vol = int(state.get("volume") or 70)
+            playing = bool(state.get("playing"))
+            return [
+                ("tone_type", f"Tone Type: {tone.title()}"),
+                ("freq",      f"Frequency: {freq}Hz"),
+                ("pulse_ms",  f"Sweep Rate: {pulse}ms"),
+                ("volume",    f"Volume: {vol}%"),
+                ("play",      f"Play: {'STOP' if playing else 'PLAY'}"),
+            ]
+
+        def draw_tone() -> None:
+            rows = _rows_from_state()
+            cursor = str(state.get("cursor") or "freq")
+            ready = bool(state.get("ready"))
+            playing = bool(state.get("playing"))
+
+            keys = [k for (k, _) in rows]
+            try:
+                ci = keys.index(cursor)
+            except Exception:
+                ci = 1
+
+            start = max(0, min(ci - 1, len(rows) - 3))
+            window = rows[start:start + 3]
+
+            status = "PLAY" if playing else ("RDY" if ready else "ERR")
+
+            toast_active = False
+            now = time.time()
+            if state.get("toast") and now < float(state.get("toast_until") or 0.0):
+                toast_active = True
+                toast_text = str(state.get("toast") or "")[:21]
+            else:
+                toast_text = ""
+
+            oled_guard()
+            with canvas(device) as draw:
+                _draw_header(draw, "Tone Generator", status=status)
+
+                y0 = 14
+                row_h = 12
+                for i, (k, label) in enumerate(window):
+                    _draw_row(draw, y0 + i * row_h, label, selected=(k == cursor))
+
+                _draw_footer(draw, "SEL=chg HOLD=rev")
+
+                # Toast overlay (draw last, same frame -> no flicker)
+                if toast_active and toast_text:
+                    draw.rectangle((0, 38, 127, 51), outline=255, fill=0)
+                    draw.text((2, 40), toast_text, fill=255)
+
+        def draw_tone_fatal() -> None:
+            msg = (str(state.get("fatal") or "Unknown error"))[:21]
+            oled_message("Tone Generator", ["ERROR", msg, ""], "BACK")
+
+        while proc.poll() is None:
+            msgs = pump.pump(max_bytes=65536, max_lines=120)
+            if msgs:
+                last_msg_time = time.time()
+
+            exit_requested = False
+
+            for msg in msgs:
+                t = msg.get("type")
+
+                if t == "page":
+                    state["page"] = msg.get("name", state.get("page", "main"))
+
+                elif t == "state":
+                    for k in ("ready", "tone_type", "freq_hz", "volume", "pulse_ms", "playing", "cursor"):
+                        if k in msg:
+                            state[k] = msg.get(k)
+
+                elif t == "toast":
+                    txt = str(msg.get("message") or "")[:21]
+                    if txt:
+                        state["toast"] = txt
+                        state["toast_until"] = time.time() + 1.2
+
+                elif t == "fatal":
+                    state["page"] = "fatal"
+                    state["fatal"] = str(msg.get("message", "fatal"))
+                    # also show as toast briefly
+                    state["toast"] = state["fatal"][:21]
+                    state["toast_until"] = time.time() + 2.0
+
+                elif t == "exit":
+                    exit_requested = True
+
+            now = time.time()
+            silent_s = now - last_msg_time
+
+            if (now - last_draw_time) >= 0.08:
+                if state.get("page") == "fatal":
+                    draw_tone_fatal()
+                else:
+                    draw_tone()
+                last_draw_time = now
+
+            if exit_requested:
+                for _ in range(25):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is not None:
+                    break
+
+            # forward buttons
+            if consume("up"):
+                send("up")
+            if consume("down"):
+                send("down")
+            if consume("select"):
+                send("select")
+            if consume("select_hold"):
+                send("select_hold")
+
+            if consume("back"):
+                send("back")
+                for _ in range(50):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                break
+
+            # required: heartbeat at least every 250ms; treat silence as hang
+            if silent_s > 15.0:
+                log("[launcher] watchdog: tone_generator silent >15s; terminating")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
+            time.sleep(0.02)
+
         try:
             if pump:
                 pump.close()
@@ -1246,7 +1393,6 @@ def run_module(mod: Module, consume, clear) -> None:
 
     # Child may have left OLED off; recover here
     oled_hard_wake()
-
 
 # =====================================================
 # MAIN
