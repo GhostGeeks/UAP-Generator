@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BlackBox Tone Generator (headless JSON stdout protocol)
+BlackBox Tone Generator (continuous tone, headless JSON stdout protocol)
 
 RULES:
 - MUST NOT import luma.oled or access OLED
@@ -9,7 +9,7 @@ RULES:
 - MUST NOT block stdin loop (non-blocking os.read + selectors)
 - Communicate ONLY via JSON lines over stdout
 - Exit cleanly on back (stop audio first)
-- Pi-friendly audio: generate a pulsed WAV pattern and loop it with paplay/pw-play in one background process
+- Pi-friendly audio: generate a continuous-tone WAV pattern and loop it with paplay/pw-play in one background process
 """
 
 import os
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 MODULE_NAME = "tone_generator"
-MODULE_VERSION = "tg_v1"
+MODULE_VERSION = "tg_v2_continuous"
 
 # Files
 PATTERN_WAV = "/tmp/blackbox_tone_pattern.wav"
@@ -37,13 +37,11 @@ MODULE_ERR = "/tmp/blackbox_tone_module.err"
 RATE = 48000
 CHANNELS = 1
 SAMPWIDTH = 2  # 16-bit
-PATTERN_SECONDS = 8.0
-DUTY = 0.90  # ~90% on within each pulse period
+PATTERN_SECONDS = 8.0  # long enough so paplay overhead is low
 
 # UX rows (cursor)
-ROWS = ["tone_type", "freq", "pulse_ms", "volume", "play"]
+ROWS = ["tone_type", "freq", "volume", "play"]
 TONE_TYPES = ["sine", "square", "saw", "triangle"]
-PULSE_MS_OPTIONS = [150, 200, 250, 300]
 
 HEARTBEAT_S = 0.25
 TOAST_MIN_INTERVAL_S = 0.10
@@ -92,7 +90,6 @@ class TGState:
     tone_type: str = "sine"
     freq_hz: int = 440
     volume: int = 70
-    pulse_ms: int = 200
     playing: bool = False
     cursor: str = "freq"
     ready: bool = False
@@ -106,6 +103,7 @@ def _clamp(v: int, lo: int, hi: int) -> int:
 
 
 def _freq_step(freq: int) -> int:
+    # “musically sensible” stepping
     if freq < 200:
         return 5
     if freq <= 2000:
@@ -136,7 +134,6 @@ def _state_msg(st: TGState) -> dict:
         "tone_type": st.tone_type,
         "freq_hz": int(st.freq_hz),
         "volume": int(st.volume),
-        "pulse_ms": int(st.pulse_ms),
         "playing": bool(st.playing),
         "cursor": st.cursor,
     }
@@ -150,10 +147,10 @@ def _toast_throttle(st: TGState, msg: str) -> None:
 
 
 # ----------------------------
-# WAV generation (pulsed tone pattern)
+# WAV generation (continuous tone pattern)
 # ----------------------------
-def _waveform_sample(t: float, freq: float, kind: str) -> float:
-    phase = (t * freq) % 1.0  # 0..1
+def _waveform_sample(phase: float, kind: str) -> float:
+    # phase: 0..1
     if kind == "sine":
         return math.sin(2.0 * math.pi * phase)
     if kind == "square":
@@ -165,18 +162,18 @@ def _waveform_sample(t: float, freq: float, kind: str) -> float:
     return math.sin(2.0 * math.pi * phase)
 
 
-def _write_pattern_wav(tone_type: str, freq_hz: int, volume: int, pulse_ms: int) -> None:
+def _write_pattern_wav(tone_type: str, freq_hz: int, volume: int) -> None:
+    """
+    Generates /tmp/blackbox_tone_pattern.wav:
+    - total duration PATTERN_SECONDS
+    - continuous tone (no gating)
+    """
     freq_hz = _clamp(int(freq_hz), 20, 20000)
     volume = _clamp(int(volume), 0, 100)
-    pulse_ms = _clamp(int(pulse_ms), 50, 2000)
     if tone_type not in TONE_TYPES:
         tone_type = "sine"
 
     total_frames = int(RATE * PATTERN_SECONDS)
-    period_frames = max(1, int(RATE * (pulse_ms / 1000.0)))
-    on_frames = max(1, int(period_frames * DUTY))
-    off_frames = max(0, period_frames - on_frames)
-
     amp = (volume / 100.0) * 0.95  # headroom
 
     tmp_path = PATTERN_WAV + ".tmp"
@@ -185,33 +182,26 @@ def _write_pattern_wav(tone_type: str, freq_hz: int, volume: int, pulse_ms: int)
         wf.setsampwidth(SAMPWIDTH)
         wf.setframerate(RATE)
 
-        # Precompute one period bytes for speed
-        period_bytes = bytearray()
+        # Stream frames to avoid large memory usage
+        # Maintain phase accumulator for stable waveform
+        phase = 0.0
+        phase_inc = float(freq_hz) / float(RATE)  # cycles per sample
 
-        # Tone segment
-        for i in range(on_frames):
-            t = i / float(RATE)
-            s = _waveform_sample(t, float(freq_hz), tone_type) * amp
+        block = bytearray()
+        block_target_frames = 2048  # small-ish blocks for speed/memory balance
+
+        for _ in range(total_frames):
+            s = _waveform_sample(phase % 1.0, tone_type) * amp
             v = int(max(-1.0, min(1.0, s)) * 32767)
-            period_bytes += int(v).to_bytes(2, byteorder="little", signed=True)
+            block += int(v).to_bytes(2, byteorder="little", signed=True)
 
-        # Silence segment
-        if off_frames > 0:
-            period_bytes += b"\x00\x00" * off_frames
+            phase += phase_inc
+            if len(block) >= block_target_frames * 2:
+                wf.writeframes(block)
+                block.clear()
 
-        period_len_frames = on_frames + off_frames
-        if period_len_frames <= 0:
-            period_bytes = b"\x00\x00" * 1024
-            period_len_frames = 1024
-
-        frames_written = 0
-        while frames_written + period_len_frames <= total_frames:
-            wf.writeframes(period_bytes)
-            frames_written += period_len_frames
-
-        remaining = total_frames - frames_written
-        if remaining > 0:
-            wf.writeframes(period_bytes[: remaining * 2])
+        if block:
+            wf.writeframes(block)
 
     os.replace(tmp_path, PATTERN_WAV)
 
@@ -220,17 +210,21 @@ def _write_pattern_wav(tone_type: str, freq_hz: int, volume: int, pulse_ms: int)
 # Audio loop process management
 # ----------------------------
 def _which_player():
+    # Prefer paplay (Pulse/PipeWire-Pulse), fallback pw-play
     p = shutil.which("paplay")
     if p:
-        return ("paplay", p)
+        return p
     p = shutil.which("pw-play")
     if p:
-        return ("pw-play", p)
-    return (None, None)
+        return p
+    return None
 
 
 def _start_audio_loop(player_path: str) -> subprocess.Popen:
-    # Loop continuously; stderr goes to AUDIO_ERR; stdout discarded.
+    """
+    Start one background shell loop that repeatedly plays the pattern WAV.
+    Stderr for loop/player goes to AUDIO_ERR.
+    """
     try:
         open(AUDIO_ERR, "a").close()
     except Exception:
@@ -247,7 +241,7 @@ def _start_audio_loop(player_path: str) -> subprocess.Popen:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
-        env=os.environ.copy(),  # keep systemd env (XDG_RUNTIME_DIR, PULSE_SERVER)
+        env=os.environ.copy(),  # keep systemd audio env
     )
 
 
@@ -332,10 +326,6 @@ def _apply_forward(st: TGState) -> None:
         st.freq_hz = _clamp(st.freq_hz + step, 20, 20000)
         st._need_audio_restart = True
         _toast_throttle(st, "Freq: {0}Hz".format(st.freq_hz))
-    elif c == "pulse_ms":
-        st.pulse_ms = _next_in_list(PULSE_MS_OPTIONS, st.pulse_ms)
-        st._need_audio_restart = True
-        _toast_throttle(st, "Sweep: {0}ms".format(st.pulse_ms))
     elif c == "volume":
         st.volume = _clamp(st.volume + 5, 0, 100)
         st._need_audio_restart = True
@@ -357,15 +347,12 @@ def _apply_reverse(st: TGState) -> None:
         st.freq_hz = _clamp(st.freq_hz - step, 20, 20000)
         st._need_audio_restart = True
         _toast_throttle(st, "Freq: {0}Hz".format(st.freq_hz))
-    elif c == "pulse_ms":
-        st.pulse_ms = _prev_in_list(PULSE_MS_OPTIONS, st.pulse_ms)
-        st._need_audio_restart = True
-        _toast_throttle(st, "Sweep: {0}ms".format(st.pulse_ms))
     elif c == "volume":
         st.volume = _clamp(st.volume - 5, 0, 100)
         st._need_audio_restart = True
         _toast_throttle(st, "Vol: {0}%".format(st.volume))
     elif c == "play":
+        # hold on Play means “stop”
         if st.playing:
             st.playing = False
             st._need_audio_restart = True
@@ -390,11 +377,11 @@ def main() -> int:
     st = TGState()
     reader = StdinReader()
 
-    player_kind, player_path = _which_player()
+    player_path = _which_player()
 
     _hello()
 
-    if not player_kind or not player_path:
+    if not player_path:
         st.ready = False
         _emit(_state_msg(st))
         _fatal("Audio player not available (need paplay or pw-play)")
@@ -404,9 +391,9 @@ def main() -> int:
 
     audio_proc = None  # type: Optional[subprocess.Popen]
 
-    # initialize pattern wav
+    # Initialize pattern wav
     try:
-        _write_pattern_wav(st.tone_type, st.freq_hz, st.volume, st.pulse_ms)
+        _write_pattern_wav(st.tone_type, st.freq_hz, st.volume)
     except Exception as e:
         _log_err("WAV init failed: {0!r}".format(e))
         st.ready = False
@@ -423,7 +410,7 @@ def main() -> int:
             st.playing = False
             st._need_audio_restart = True
 
-        # read stdin commands (non-blocking)
+        # Read stdin commands (non-blocking)
         for cmd in reader.poll_lines(timeout=0.0):
             if cmd == "up":
                 _move_cursor(st, -1)
@@ -442,7 +429,7 @@ def main() -> int:
                 st._need_audio_restart = True
                 exiting["flag"] = True
 
-        # audio mgmt (fast, non-blocking)
+        # Audio management (fast, non-blocking)
         try:
             if st._need_audio_restart:
                 st._need_audio_restart = False
@@ -452,7 +439,7 @@ def main() -> int:
 
                 if st.playing and st.ready and player_path:
                     try:
-                        _write_pattern_wav(st.tone_type, st.freq_hz, st.volume, st.pulse_ms)
+                        _write_pattern_wav(st.tone_type, st.freq_hz, st.volume)
                     except Exception as e:
                         _log_err("WAV regen failed: {0!r}".format(e))
                         st.playing = False
@@ -461,7 +448,7 @@ def main() -> int:
                     else:
                         audio_proc = _start_audio_loop(player_path)
 
-            # if it died unexpectedly, recover
+            # If loop dies unexpectedly while playing, recover
             if st.playing and audio_proc and (audio_proc.poll() is not None):
                 _log_err("Audio loop exited unexpectedly; restarting")
                 st._need_audio_restart = True
@@ -472,7 +459,7 @@ def main() -> int:
             st.playing = False
             st._need_audio_restart = True
 
-        # heartbeat (at least every 250ms)
+        # Heartbeat at least every 250ms
         if now - last_hb >= HEARTBEAT_S:
             last_hb = now
             _emit(_state_msg(st))
@@ -491,7 +478,6 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
-        # Never leak tracebacks to stdout
         _log_err("FATAL unhandled: {0!r}".format(e))
         _fatal("Unhandled error in tone generator")
         try:
