@@ -1023,42 +1023,50 @@ def run_module(mod: Module, consume, clear) -> None:
 
         def draw_noise_main() -> None:
             mode_raw = str(state.get("mode") or "white").strip().lower()
-            mode = mode_raw[:1].upper() + mode_raw[1:] if mode_raw else "White"
+            # display label
+            if mode_raw == "white":
+                mode_disp = "White"
+            elif mode_raw == "pink":
+                mode_disp = "Pink"
+            elif mode_raw == "brown":
+                mode_disp = "Brown"
+            elif mode_raw == "sweep":
+                mode_disp = "Sweep"
+            else:
+                mode_disp = (mode_raw[:1].upper() + mode_raw[1:]) if mode_raw else "White"
 
-            playing = bool(state.get("playing"))
+            focus = str(state.get("focus") or "mode").strip().lower()
+            pulse_ms = int(state.get("pulse_ms") or 200)
             vol = int(state.get("volume") or 0)
             vol = max(0, min(100, vol))
 
-            pulse_ms = int(state.get("pulse_ms") or 200)
-            focus = str(state.get("focus") or "mode")
-            backend = str(state.get("backend") or "")
-
+            playing = bool(state.get("playing"))
             status = "PLAY" if playing else "STOP"
 
-            # Toast override
+            # Toast overlay (short-lived); we’ll show it as line 3 temporarily
             now = time.time()
             toast = ""
             if state.get("toast") and now < float(state.get("toast_until") or 0.0):
                 toast = str(state.get("toast") or "")[:21]
 
-            # Title shows adjustment focus
-            title = "Noise Gen"
-            if focus == "volume":
-                title = "Noise Gen [VOL]"
-            elif focus == "pulse":
-                title = "Noise Gen [PULSE]"
-            else:
-                title = "Noise Gen [MODE]"
+            # Bracket the focused value to mimic “submenu selection”
+            def fmt_value(label: str, value: str, is_focus: bool) -> str:
+                v = f"<{value}>"
+                if is_focus:
+                    v = f"[{v}]"
+                # keep within 21 chars for SSD1306 font
+                return f"{label}{v}"[:21]
 
-            line1 = f"MODE {mode}"[:21]
-            line2 = toast if toast else f"{status}  VOL {vol:3d}"[:21]
+            line1 = fmt_value("Noise Type: ", mode_disp, focus == "mode")
+            line2 = fmt_value("Sweep Rate:", f"{pulse_ms}ms", focus == "pulse")
+            line3 = fmt_value("Volume:    ", f"{vol}%", focus == "volume")
 
-            if mode_raw == "sweep":
-                line3 = f"PULSE {pulse_ms}ms"[:21]
-            else:
-                line3 = (backend.upper() if backend else "LOOP")[:21]
+            # If toast is active, override line3 (least important)
+            if toast:
+                line3 = toast[:21]
 
-            oled_message(title, [line1, line2, line3], "SEL=Play HOLD=Adj BACK")
+            # Footer hint stays simple
+            oled_message("Noise Generator", [line1, line2, line3], f"SEL={status} HOLD=Next BACK")
 
         def draw_noise_fatal() -> None:
             msg = (str(state.get("fatal") or "Unknown error"))[:21]
