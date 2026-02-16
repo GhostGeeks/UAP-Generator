@@ -1003,6 +1003,9 @@ def run_module(mod: Module, consume, clear) -> None:
             "playing": False,
             "volume": 70,
             "loop": True,
+            "pulse_ms": 200,
+            "focus": "mode",
+            "backend": "",
             "fatal": "",
             "toast": "",
             "toast_until": 0.0,
@@ -1019,26 +1022,43 @@ def run_module(mod: Module, consume, clear) -> None:
             return m[:1].upper() + m[1:]
 
         def draw_noise_main() -> None:
-            mode = _norm_mode(str(state.get("mode") or "white"))
+            mode_raw = str(state.get("mode") or "white").strip().lower()
+            mode = mode_raw[:1].upper() + mode_raw[1:] if mode_raw else "White"
+
             playing = bool(state.get("playing"))
             vol = int(state.get("volume") or 0)
             vol = max(0, min(100, vol))
-            loop = bool(state.get("loop", True))
+
+            pulse_ms = int(state.get("pulse_ms") or 200)
+            focus = str(state.get("focus") or "mode")
+            backend = str(state.get("backend") or "")
 
             status = "PLAY" if playing else "STOP"
-            loop_s = "LOOP" if loop else "ONCE"
 
-            # Toast overrides line2 briefly
+            # Toast override
             now = time.time()
             toast = ""
             if state.get("toast") and now < float(state.get("toast_until") or 0.0):
                 toast = str(state.get("toast") or "")[:21]
 
+            # Title shows adjustment focus
+            title = "Noise Gen"
+            if focus == "volume":
+                title = "Noise Gen [VOL]"
+            elif focus == "pulse":
+                title = "Noise Gen [PULSE]"
+            else:
+                title = "Noise Gen [MODE]"
+
             line1 = f"MODE {mode}"[:21]
             line2 = toast if toast else f"{status}  VOL {vol:3d}"[:21]
-            line3 = f"{loop_s}"[:21]
 
-            oled_message("Noise Generator", [line1, line2, line3], "SEL=Play HOLD=Adj BACK")
+            if mode_raw == "sweep":
+                line3 = f"PULSE {pulse_ms}ms"[:21]
+            else:
+                line3 = (backend.upper() if backend else "LOOP")[:21]
+
+            oled_message(title, [line1, line2, line3], "SEL=Play HOLD=Adj BACK")
 
         def draw_noise_fatal() -> None:
             msg = (str(state.get("fatal") or "Unknown error"))[:21]
@@ -1073,6 +1093,17 @@ def run_module(mod: Module, consume, clear) -> None:
                             pass
                     if "loop" in msg:
                         state["loop"] = bool(msg.get("loop"))
+
+                    # NEW: pulse / focus / backend support
+                    if "pulse_ms" in msg:
+                        try:
+                            state["pulse_ms"] = int(msg.get("pulse_ms"))
+                        except Exception:
+                            pass
+                    if "focus" in msg:
+                        state["focus"] = str(msg.get("focus") or state.get("focus") or "mode")
+                    if "backend" in msg:
+                        state["backend"] = str(msg.get("backend") or state.get("backend") or "")
 
                 elif t == "toast":
                     txt = str(msg.get("message") or "")[:21]
