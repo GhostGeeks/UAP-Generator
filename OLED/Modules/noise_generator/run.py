@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-BlackBox - Noise Generator (headless module)
+BlackBox - Noise Generator (headless module) - ALWAYS PULSED (spirit-box style)
 
-Adds "sweep" pulsed static with adjustable pulse rate (150/200/250/300ms).
+- Noise is always played as repeated short "ticks" at a user-selected pulse rate.
+- Noise types change the tick texture (white/pink/brown; future types easy to add).
+- Pulse rate options: 150/200/250/300 ms (spirit box sweep style)
 - JSON-only stdout (NEVER print anything else)
 - Non-blocking stdin (selectors + os.read)
 - Heartbeat state at least every 250ms
-- Playback via background process (paplay preferred, then pw-play, then aplay)
+- Playback via one background /bin/sh loop (paplay preferred, then pw-play, then aplay)
 - Capture audio errors to /tmp/blackbox_noise_audio.err (never stdout)
 - Exit immediately on back (stop playback first)
 """
@@ -22,10 +24,10 @@ import tempfile
 import time
 import wave
 import random
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 MODULE_NAME = "noise_generator"
-MODULE_VERSION = "ng_v1_sweep"
+MODULE_VERSION = "ng_v2_pulsed"
 
 HEARTBEAT_S = 0.25
 TICK_S = 0.05
@@ -34,10 +36,8 @@ SAMPLE_RATE = 44100
 CHANNELS = 2
 SAMPLE_WIDTH = 2  # int16
 
-# Continuous noise loop duration (longer = fewer loop seams)
-WAV_SECONDS = 10.0
-
-# Sweep "tick" size (ms). Pulse rate controls spacing between ticks.
+# Length of each "static tick" in milliseconds.
+# Pulse rate controls the spacing between ticks.
 TICK_MS = 70
 
 TMP_PREFIX = "blackbox_noise_"
@@ -45,8 +45,9 @@ AUDIO_ERR_LOG = "/tmp/blackbox_noise_audio.err"
 
 PULSE_OPTIONS_MS = [150, 200, 250, 300]
 
-MODES: List[str] = ["white", "pink", "brown", "sweep"]
-MODE_LABEL = {"white": "White", "pink": "Pink", "brown": "Brown", "sweep": "Sweep"}
+# Noise types (future values can be added here)
+MODES: List[str] = ["white", "pink", "brown"]
+MODE_LABEL = {"white": "White", "pink": "Pink", "brown": "Brown"}
 
 
 def _emit(obj: Dict[str, Any]) -> None:
@@ -56,7 +57,7 @@ def _emit(obj: Dict[str, Any]) -> None:
 
 def _safe_err(e: BaseException) -> str:
     s = (str(e) or e.__class__.__name__).strip()
-    return s[:200]
+    return s[:220]
 
 
 def _which(cmd: str) -> Optional[str]:
@@ -84,7 +85,7 @@ def _gen_white(n: int, rng: random.Random) -> List[float]:
 
 
 def _gen_pink(n: int, rng: random.Random) -> List[float]:
-    # Voss-McCartney; lightweight
+    # Voss-McCartney; lightweight and good enough for short ticks
     rows_n = 16
     rows = [rng.uniform(-1.0, 1.0) for _ in range(rows_n)]
     s = sum(rows)
@@ -107,6 +108,7 @@ def _gen_pink(n: int, rng: random.Random) -> List[float]:
 
 
 def _gen_brown(n: int, rng: random.Random) -> List[float]:
+    # Integrated noise; normalize for tick window
     out: List[float] = []
     x = 0.0
     for _ in range(n):
@@ -122,9 +124,9 @@ def _apply_fade(mono: List[float], fade_ms: int) -> List[float]:
     if not mono:
         return mono
     fade_n = int(SAMPLE_RATE * (fade_ms / 1000.0))
-    fade_n = max(1, min(fade_n, len(mono) // 4))
+    fade_n = max(1, min(fade_n, len(mono) // 3))
     N = len(mono)
-    out = mono[:]  # copy
+    out = mono[:]
     for i in range(N):
         g = 1.0
         if i < fade_n:
@@ -138,7 +140,7 @@ def _apply_fade(mono: List[float], fade_ms: int) -> List[float]:
 
 
 def _write_wav(path: str, mono: List[float], volume_pct: int) -> None:
-    amp = (volume_pct / 100.0) * 0.8  # headroom
+    amp = (volume_pct / 100.0) * 0.85  # headroom
     with wave.open(path, "wb") as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(SAMPLE_WIDTH)
@@ -153,54 +155,44 @@ def _write_wav(path: str, mono: List[float], volume_pct: int) -> None:
         wf.writeframes(frames)
 
 
-def _build_continuous_noise(mode: str, volume: int, seconds: float) -> List[float]:
-    n = int(SAMPLE_RATE * seconds)
-    rng = random.Random(0xB10C0 + volume + (MODES.index(mode) * 1337))
-
-    if mode == "white":
-        mono = _gen_white(n, rng)
-    elif mode == "pink":
-        mono = _gen_pink(n, rng)
-    else:
-        mono = _gen_brown(n, rng)
-
-    # Small fades smooth loop edges
-    mono = _apply_fade(mono, fade_ms=35)
-    return mono
-
-
-def _build_sweep_ticks(volume: int, tick_ms: int, variants: int = 3) -> List[List[float]]:
-    """
-    Build a few short "static tick" variants. These are intentionally short and repeated rapidly.
-    """
+def _build_tick_variants(mode: str, volume: int, tick_ms: int, variants: int = 3) -> List[List[float]]:
     seconds = max(0.02, tick_ms / 1000.0)
     n = int(SAMPLE_RATE * seconds)
-
     ticks: List[List[float]] = []
-    for k in range(variants):
-        rng = random.Random(0x515745 + volume * 17 + k * 999)
-        # Use mostly white-like noise but a tad softer and with fade
-        mono = _gen_white(n, rng)
-        # slight shaping: soften extremes a touch
-        mono = [max(-1.0, min(1.0, x * 0.9)) for x in mono]
+
+    for k in range(max(1, variants)):
+        rng = random.Random(0x515745 + volume * 17 + k * 999 + (MODES.index(mode) * 1337))
+
+        if mode == "white":
+            mono = _gen_white(n, rng)
+        elif mode == "pink":
+            mono = _gen_pink(n, rng)
+        else:
+            mono = _gen_brown(n, rng)
+
+        # Slight shaping (makes it feel more "radio/static" and less harsh)
+        mono = [max(-1.0, min(1.0, x * 0.92)) for x in mono]
+
+        # Fade removes clicks at tick edges
         mono = _apply_fade(mono, fade_ms=8)
+
         ticks.append(mono)
+
     return ticks
 
 
 class AudioLoop:
     """
-    Runs a single background /bin/sh loop process.
+    One background /bin/sh loop:
+      play a tick wav
+      sleep gap
+      play next tick wav (round-robin)
+      ...
 
-    Two modes:
-      - continuous: loop a single WAV as fast as possible (EOF restart)
-      - sweep: play short tick WAVs and sleep to achieve pulse_ms cadence
-
-    Stderr from the player(s) is appended to AUDIO_ERR_LOG (never stdout).
+    Player stderr is appended to AUDIO_ERR_LOG (never stdout).
     """
 
     def __init__(self) -> None:
-        # Prefer Pulse in your systemd env
         for c in ("paplay", "pw-play", "aplay"):
             p = _which(c)
             if p:
@@ -267,74 +259,35 @@ class AudioLoop:
             return f'"{self.player_path}" "{wav_path}"'
         if self.player == "paplay":
             return f'"{self.player_path}" "{wav_path}"'
-        # aplay
         return f'"{self.player_path}" -q "{wav_path}"'
 
-    def start_continuous(self, wav_path: str) -> None:
+    def start_pulsed(self, tick_paths: List[str], pulse_ms: int, tick_ms: int) -> None:
         self.stop()
         self.last_exit_code = None
+
         if not self.available():
             raise RuntimeError("No audio player found (paplay/pw-play/aplay)")
-
-        try:
-            with open(AUDIO_ERR_LOG, "w") as f:
-                f.write("")
-        except Exception:
-            pass
-
-        play_cmd = self._player_cmd(wav_path)
-        loop_cmd = f'while true; do {play_cmd} 1>/dev/null 2>>"{AUDIO_ERR_LOG}"; done'
-
-        self.proc = subprocess.Popen(
-            ["/bin/sh", "-c", loop_cmd],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid,
-            close_fds=True,
-        )
-
-        time.sleep(0.05)
-        if self.proc.poll() is not None:
-            self.last_exit_code = self.proc.returncode
-            raise RuntimeError(f"Audio loop failed ({self.died_reason()})")
-
-    def start_sweep(self, tick_paths: List[str], pulse_ms: int, tick_ms: int) -> None:
-        """
-        Plays tick files in a tight loop and sleeps to approximate pulse cadence.
-        Uses one /bin/sh process; no external random/shuf dependency.
-        """
-        self.stop()
-        self.last_exit_code = None
-        if not self.available():
-            raise RuntimeError("No audio player found (paplay/pw-play/aplay)")
-
         if not tick_paths:
             raise RuntimeError("No tick paths provided")
 
+        # clear error log
         try:
             with open(AUDIO_ERR_LOG, "w") as f:
                 f.write("")
         except Exception:
             pass
 
-        # Sleep between ticks to achieve cadence
         gap_ms = max(0, int(pulse_ms) - int(tick_ms))
         gap_s = gap_ms / 1000.0
 
-        # Round-robin tick selection in shell: i=(i+1)%N
-        # Note: bash arithmetic is available via /bin/sh on Debian (dash supports $(( )))
-        # Keep it simple with a case ladder.
+        # Build a dash-compatible round-robin case statement
         n = len(tick_paths)
-        # Build a case statement for i
         case_lines = []
         for idx, tp in enumerate(tick_paths):
             play_cmd = self._player_cmd(tp)
             case_lines.append(f'{idx}) {play_cmd} 1>/dev/null 2>>"{AUDIO_ERR_LOG}" ;;')
         case_block = " ".join(case_lines)
 
-        # dash-compatible loop:
-        # i=0; while true; do case $i in ... esac; i=$(( (i+1) % n )); sleep gap; done
         loop_cmd = (
             f'i=0; while true; do '
             f'case "$i" in {case_block} esac; '
@@ -355,7 +308,7 @@ class AudioLoop:
         time.sleep(0.05)
         if self.proc.poll() is not None:
             self.last_exit_code = self.proc.returncode
-            raise RuntimeError(f"Sweep loop failed ({self.died_reason()})")
+            raise RuntimeError(f"Pulsed loop failed ({self.died_reason()})")
 
 
 class NoiseModule:
@@ -374,18 +327,15 @@ class NoiseModule:
         self.mode = MODES[self.mode_idx]
         self.playing = False
         self.volume = 70
-        self.loop = True  # informational only for now; always looping behavior
 
         self.pulse_idx = 1  # default 200ms
         self.pulse_ms = PULSE_OPTIONS_MS[self.pulse_idx]
 
-        # focus cycles: mode -> volume -> pulse -> mode
-        self.focus = "mode"
+        # Focus order matches your UI rows: Noise Type -> Sweep Rate -> Volume
+        self.focus = "mode"  # "mode" | "pulse" | "volume"
         self._stdin_buf = b""
 
-        # temp paths
         self._tmpdir = tempfile.gettempdir()
-        self._wav_path = os.path.join(self._tmpdir, f"{TMP_PREFIX}{os.getpid()}_loop.wav")
         self._tick_paths = [
             os.path.join(self._tmpdir, f"{TMP_PREFIX}{os.getpid()}_tick0.wav"),
             os.path.join(self._tmpdir, f"{TMP_PREFIX}{os.getpid()}_tick1.wav"),
@@ -403,7 +353,7 @@ class NoiseModule:
         _emit({"type": "toast", "message": str(msg)[:160]})
 
     def fatal(self, msg: str) -> None:
-        self._fatal = str(msg)[:200]
+        self._fatal = str(msg)[:220]
         _emit({"type": "fatal", "message": self._fatal})
 
     def emit_state(self, force: bool = False) -> None:
@@ -417,19 +367,14 @@ class NoiseModule:
             "mode": self.mode,
             "playing": bool(self.playing),
             "volume": int(self.volume),
-            "duration_s": 0,
-            "loop": bool(self.loop),
-            "focus": self.focus,
             "pulse_ms": int(self.pulse_ms),
+            "focus": self.focus,
+            # backend left for logs/debug but you can ignore in UI
             "backend": self.audio.backend_name(),
         })
 
-    def _write_loop_wav(self) -> None:
-        mono = _build_continuous_noise(self.mode, self.volume, WAV_SECONDS)
-        _write_wav(self._wav_path, mono, self.volume)
-
     def _write_tick_wavs(self) -> None:
-        ticks = _build_sweep_ticks(self.volume, TICK_MS, variants=len(self._tick_paths))
+        ticks = _build_tick_variants(self.mode, self.volume, TICK_MS, variants=len(self._tick_paths))
         for tp, mono in zip(self._tick_paths, ticks):
             _write_wav(tp, mono, self.volume)
 
@@ -439,13 +384,8 @@ class NoiseModule:
         if not self.audio.available():
             raise RuntimeError("Audio backend not available (need paplay/pw-play/aplay)")
 
-        if self.mode == "sweep":
-            self._write_tick_wavs()
-            self.audio.start_sweep(self._tick_paths, self.pulse_ms, TICK_MS)
-        else:
-            self._write_loop_wav()
-            self.audio.start_continuous(self._wav_path)
-
+        self._write_tick_wavs()
+        self.audio.start_pulsed(self._tick_paths, self.pulse_ms, TICK_MS)
         self.playing = True
 
     def _stop_audio(self) -> None:
@@ -458,39 +398,31 @@ class NoiseModule:
         self._stop_audio()
         self._start_audio()
 
-    def _set_mode(self, idx: int) -> None:
-        self.mode_idx = idx % len(MODES)
-        self.mode = MODES[self.mode_idx]
-        self.toast(f"Mode: {MODE_LABEL.get(self.mode, self.mode.title())}")
-        self._restart_if_playing()
+    def _cycle_focus(self) -> None:
+        if self.focus == "mode":
+            self.focus = "pulse"
+        elif self.focus == "pulse":
+            self.focus = "volume"
+        else:
+            self.focus = "mode"
+        self.emit_state(force=True)
 
     def _change_mode(self, delta: int) -> None:
-        self._set_mode(self.mode_idx + delta)
+        self.mode_idx = (self.mode_idx + delta) % len(MODES)
+        self.mode = MODES[self.mode_idx]
+        self.toast(f"Noise Type: {MODE_LABEL.get(self.mode, self.mode.title())}")
+        self._restart_if_playing()
+
+    def _change_pulse(self, delta: int) -> None:
+        self.pulse_idx = (self.pulse_idx + delta) % len(PULSE_OPTIONS_MS)
+        self.pulse_ms = PULSE_OPTIONS_MS[self.pulse_idx]
+        self.toast(f"Sweep Rate: {self.pulse_ms}ms")
+        self._restart_if_playing()
 
     def _change_volume(self, delta: int) -> None:
         self.volume = _clamp(self.volume + delta, 0, 100)
-        self.toast(f"Volume: {self.volume}")
+        self.toast(f"Volume: {self.volume}%")
         self._restart_if_playing()
-
-    def _set_pulse_idx(self, idx: int) -> None:
-        self.pulse_idx = idx % len(PULSE_OPTIONS_MS)
-        self.pulse_ms = PULSE_OPTIONS_MS[self.pulse_idx]
-        self.toast(f"Pulse: {self.pulse_ms}ms")
-        if self.mode == "sweep":
-            self._restart_if_playing()
-
-    def _change_pulse(self, delta: int) -> None:
-        self._set_pulse_idx(self.pulse_idx + delta)
-
-    def _cycle_focus(self) -> None:
-        if self.focus == "mode":
-            self.focus = "volume"
-        elif self.focus == "volume":
-            self.focus = "pulse"
-        else:
-            self.focus = "mode"
-        self.toast(f"Adjust: {self.focus}")
-        self.emit_state(force=True)
 
     def handle(self, cmd: str) -> None:
         if cmd == "back":
@@ -502,7 +434,6 @@ class NoiseModule:
             _emit({"type": "exit"})
             return
 
-        # after fatal, ignore everything except back
         if self._fatal is not None:
             return
 
@@ -528,10 +459,10 @@ class NoiseModule:
             try:
                 if self.focus == "mode":
                     self._change_mode(+1)
-                elif self.focus == "volume":
-                    self._change_volume(+5)
-                else:
+                elif self.focus == "pulse":
                     self._change_pulse(+1)
+                else:
+                    self._change_volume(+5)
             except Exception as e:
                 self.fatal(_safe_err(e))
             finally:
@@ -542,17 +473,15 @@ class NoiseModule:
             try:
                 if self.focus == "mode":
                     self._change_mode(-1)
-                elif self.focus == "volume":
-                    self._change_volume(-5)
-                else:
+                elif self.focus == "pulse":
                     self._change_pulse(-1)
+                else:
+                    self._change_volume(-5)
             except Exception as e:
                 self.fatal(_safe_err(e))
             finally:
                 self.emit_state(force=True)
             return
-
-        # ignore unknown cmd
 
     def _read_stdin(self) -> None:
         try:
@@ -587,7 +516,6 @@ class NoiseModule:
                     if (mask & selectors.EVENT_READ) and key.fileobj == self.stdin_fd:
                         self._read_stdin()
 
-                # detect unexpected audio death
                 if self.playing and self.audio.died():
                     reason = self.audio.died_reason()
                     self.playing = False
@@ -640,8 +568,7 @@ def main() -> int:
             mod._stop_audio()
         except Exception:
             pass
-        # cleanup temp files
-        for p in [mod._wav_path] + mod._tick_paths:
+        for p in mod._tick_paths:
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
