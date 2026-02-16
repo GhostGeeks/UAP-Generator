@@ -1036,7 +1036,7 @@ def run_module(mod: Module, consume, clear) -> None:
             playing = bool(state.get("playing"))
             cursor = str(state.get("cursor") or "noise")
 
-            # Toast overlay (short-lived) replaces bottom line
+            # toast
             now = time.time()
             toast = ""
             if state.get("toast") and now < float(state.get("toast_until") or 0.0):
@@ -1049,13 +1049,13 @@ def run_module(mod: Module, consume, clear) -> None:
                 ("play",   f"Play:       {'STOP' if playing else 'PLAY'}"),
             ]
 
-            # Show 3 at a time on 128x64 (title + 3 lines). Window depends on cursor.
             idx = 0
             for i, (k, _) in enumerate(items):
                 if k == cursor:
                     idx = i
                     break
-            start = 0 if idx < 3 else 1  # window: [0..2] or [1..3]
+
+            start = 0 if idx < 3 else 1
             view = items[start:start+3]
 
             lines = []
@@ -1063,12 +1063,11 @@ def run_module(mod: Module, consume, clear) -> None:
                 prefix = ">" if k == cursor else " "
                 lines.append((prefix + text)[:21])
 
-            footer = "UP/DN=Move SEL=Set"
-            oled_message("Noise Generator", lines, footer)
+            # If toast is active, replace ONLY the 3rd line, but still only draw once
             if toast:
-                # Replace bottom line with toast (still keep cursor visible on top lines)
-                lines[-1] = toast[:21]
-                oled_message("Noise Generator", lines, footer)
+                lines[2] = toast[:21]
+
+            oled_message("Noise Generator", lines, "UP/DN=Move SEL=Set")
 
         def draw_noise_fatal() -> None:
             msg = (str(state.get("fatal") or "Unknown error"))[:21]

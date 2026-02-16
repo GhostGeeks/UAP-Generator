@@ -43,6 +43,9 @@ MODULE_VERSION = "ng_v3_cursor_play"
 HEARTBEAT_S = 0.25
 TICK_S = 0.05
 
+PATTERN_SECONDS = 8.0
+PULSE_DUTY = 0.85  # 0.7–0.95. Higher feels faster/denser.
+
 SAMPLE_RATE = 44100
 CHANNELS = 2
 SAMPLE_WIDTH = 2  # int16
@@ -325,11 +328,8 @@ class NoiseModule:
         self._last_state_emit = 0.0
 
         self._tmpdir = tempfile.gettempdir()
-        self._tick_paths = [
-            os.path.join(self._tmpdir, f"{TMP_PREFIX}{os.getpid()}_tick0.wav"),
-            os.path.join(self._tmpdir, f"{TMP_PREFIX}{os.getpid()}_tick1.wav"),
-            os.path.join(self._tmpdir, f"{TMP_PREFIX}{os.getpid()}_tick2.wav"),
-        ]
+        self._pattern_path = os.path.join(self._tmpdir, f"{TMP_PREFIX}{os.getpid()}_pattern.wav")
+
 
     def hello(self) -> None:
         _emit({"type": "hello", "module": MODULE_NAME, "version": MODULE_VERSION})
@@ -358,19 +358,78 @@ class NoiseModule:
             "cursor": self.cursor,           # one of: noise, rate, volume, play
         })
 
-    def _write_ticks(self) -> None:
-        ticks = _build_tick_variants(self.noise_type, self.volume, TICK_MS, variants=len(self._tick_paths))
-        for tp, mono in zip(self._tick_paths, ticks):
-            _write_wav(tp, mono, self.volume)
+    def _write_pattern(self) -> None:
+        total_n = int(SAMPLE_RATE * PATTERN_SECONDS)
+        pulse_n = max(1, int(SAMPLE_RATE * (self.pulse_ms / 1000.0)))
+        on_n = max(1, int(pulse_n * PULSE_DUTY))
+
+        rng = random.Random(0x515745 + self.volume * 17 + (NOISE_TYPES.index(self.noise_type) * 1337))
+        mono = [0.0] * total_n
+
+        i = 0
+        while i < total_n:
+            # generate "on" portion
+            n = min(on_n, total_n - i)
+            if self.noise_type == "white":
+                seg = _gen_white(n, rng)
+            elif self.noise_type == "pink":
+                seg = _gen_pink(n, rng)
+            else:
+                seg = _gen_brown(n, rng)
+
+            seg = [max(-1.0, min(1.0, x * 0.92)) for x in seg]
+            seg = _apply_fade(seg, fade_ms=8)
+
+            mono[i:i+n] = seg
+            i += pulse_n  # jump to next pulse start (leaves silence in between)
+        _write_wav(self._pattern_path, mono, self.volume)
 
     def _start_audio(self) -> None:
         if self.playing:
             return
         if not self.audio.available():
             raise RuntimeError("Audio backend not available (need paplay/pw-play/aplay)")
-        self._write_ticks()
-        self.audio.start_pulsed(self._tick_paths, self.pulse_ms, TICK_MS)
+        self._write_pattern()
+        self.audio.start_continuous(self._pattern_path)  # loop this file
         self.playing = True
+
+    def start_continuous(self, wav_path: str) -> None:
+        """
+        Loop a single WAV file forever using one background /bin/sh process.
+        This avoids per-tick paplay startup delay and keeps pulse timing accurate.
+        """
+        self.stop()
+        self.last_exit_code = None
+
+        if not self.available():
+            raise RuntimeError("No audio player found (paplay/pw-play/aplay)")
+
+        # clear previous error log
+        try:
+            with open(AUDIO_ERR_LOG, "w") as f:
+                f.write("")
+        except Exception:
+            pass
+
+        play_cmd = self._player_cmd(wav_path)
+
+        # Continuous loop
+        loop_cmd = f'while true; do {play_cmd} 1>/dev/null 2>>"{AUDIO_ERR_LOG}"; done'
+
+        self.proc = subprocess.Popen(
+            ["/bin/sh", "-c", loop_cmd],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+            close_fds=True,
+        )
+
+        # small validation delay
+        time.sleep(0.05)
+        if self.proc.poll() is not None:
+            self.last_exit_code = self.proc.returncode
+            raise RuntimeError(f"Audio loop failed ({self.died_reason()})")
 
     def _stop_audio(self) -> None:
         self.audio.stop()
