@@ -874,31 +874,29 @@ def run_module(mod: Module, consume, clear) -> None:
             oled_hard_wake()
             return
 
-        state = {
+        # Noise UI state (fed by child JSON)
+        state: Dict[str, Any] = {
             "page": "main",
             "ready": False,
             "noise_type": "white",
             "pulse_ms": 200,
             "playing": False,
             "cursor": "noise",        # main: noise|rate|play
-            "menu_noise_idx": 0,      # menu highlight
+            "menu_noise_idx": 0,      # scroll menu highlight
             "fatal": "",
         }
 
         last_msg_time = time.time()
         last_draw_time = 0.0
 
-        def toast_active() -> str:
-            now = time.time()
-            if state.get("toast") and now < float(state.get("toast_until") or 0.0):
-                return str(state.get("toast") or "")[:21]
-            return ""
+        def _noise_disp() -> str:
+            raw = str(state.get("noise_type") or "white").strip().lower()
+            return {"white": "White", "pink": "Pink", "brown": "Brown"}.get(
+                raw, (raw[:1].upper() + raw[1:]) if raw else "White"
+            )
 
         def draw_main() -> None:
-            noise_raw = str(state.get("noise_type") or "white").strip().lower()
-            noise_disp = {"white":"White","pink":"Pink","brown":"Brown"}.get(
-                noise_raw, (noise_raw[:1].upper() + noise_raw[1:]) if noise_raw else "White"
-            )
+            noise_disp = _noise_disp()
             pulse_ms = int(state.get("pulse_ms") or 200)
             playing = bool(state.get("playing"))
             cursor = str(state.get("cursor") or "noise")
@@ -914,31 +912,26 @@ def run_module(mod: Module, consume, clear) -> None:
                 prefix = ">" if k == cursor else " "
                 lines.append((prefix + text)[:21])
 
-            oled_message("Noise Generator", lines, "SEL=Act HOLD=Alt BACK=Exit")
+            oled_message("Noise Generator", lines, "SEL=Open HOLD=Menu BACK")
 
         def draw_noise_menu_cycle() -> None:
-            noise_raw = str(state.get("noise_type") or "white").strip().lower()
-            noise_disp = {"white":"White","pink":"Pink","brown":"Brown"}.get(
-                noise_raw, (noise_raw[:1].upper() + noise_raw[1:]) if noise_raw else "White"
-            )
+            # This menu is “cycle/apply on SEL”, “scroll menu on HOLD”
+            noise_disp = _noise_disp()
             lines = [
-                ("> " + f"{noise_disp}")[:21],
+                ("> " + noise_disp)[:21],
                 "  SEL=Next/Apply"[:21],
                 "  HOLD=Scroll"[:21],
             ]
             oled_message("Noise Types", lines, "BACK=Done")
 
         def draw_noise_menu_scroll() -> None:
+            # scroll list: up/down highlight, select choose, back cancel
             types = ["White", "Pink", "Brown"]
             idx = int(state.get("menu_noise_idx") or 0) % len(types)
-
-            # show a 3-line list centered around idx when possible
-            # since we only have 3 items today, show all
             lines = []
             for i, name in enumerate(types):
                 prefix = ">" if i == idx else " "
                 lines.append((prefix + name)[:21])
-
             oled_message("Noise Types", lines, "SEL=Choose BACK=Cancel")
 
         def draw_fatal() -> None:
@@ -947,17 +940,19 @@ def run_module(mod: Module, consume, clear) -> None:
 
         # Main noise loop
         while proc.poll() is None:
+            # 1) Drain stdout fast enough to prevent pipe fill
             msgs = pump.pump(max_bytes=65536, max_lines=160)
             if msgs:
                 last_msg_time = time.time()
 
             exit_requested = False
 
+            # 2) Apply JSON messages
             for msg in msgs:
                 t = msg.get("type")
 
                 if t == "page":
-                    state["page"] = msg.get("name", state.get("page", "main"))
+                    state["page"] = str(msg.get("name") or state.get("page") or "main")
 
                 elif t == "state":
                     if "ready" in msg:
@@ -981,17 +976,9 @@ def run_module(mod: Module, consume, clear) -> None:
                         except Exception:
                             pass
 
-                elif t == "toast":
-                    txt = str(msg.get("message") or "")[:21]
-                    if txt:
-                        state["toast"] = txt
-                        state["toast_until"] = time.time() + 1.2
-
                 elif t == "fatal":
                     state["page"] = "fatal"
                     state["fatal"] = str(msg.get("message", "fatal"))
-                    state["toast"] = state["fatal"][:21]
-                    state["toast_until"] = time.time() + 2.0
 
                 elif t == "exit":
                     exit_requested = True
@@ -999,31 +986,40 @@ def run_module(mod: Module, consume, clear) -> None:
             now = time.time()
             silent_s = now - last_msg_time
 
-            # Draw at ~12fps max (prevents flicker)
+            # 3) Draw at a sane rate
             if (now - last_draw_time) >= 0.08:
-                if str(state.get("page") or "main") == "fatal":
+                pg = str(state.get("page") or "main")
+                if pg == "fatal":
                     draw_fatal()
+                elif pg == "noise_menu_cycle":
+                    draw_noise_menu_cycle()
+                elif pg == "noise_menu_scroll":
+                    draw_noise_menu_scroll()
                 else:
                     draw_main()
                 last_draw_time = now
 
+            # 4) Exit if child requested it
             if exit_requested:
-                # allow graceful child exit
                 for _ in range(25):
                     if proc.poll() is not None:
                         break
                     time.sleep(0.02)
                 break
 
-            # Forward buttons
+            # 5) Forward buttons (HOLD FIRST)
             if consume("up"):
                 send("up")
             if consume("down"):
                 send("down")
-            if consume("select"):
-                send("select")
+
+            # Important: hold-first prevents select firing before hold
             if consume("select_hold"):
                 send("select_hold")
+                # discard any short-press queued from the same physical press
+                consume("select")
+            elif consume("select"):
+                send("select")
 
             if consume("back"):
                 send("back")
@@ -1038,7 +1034,7 @@ def run_module(mod: Module, consume, clear) -> None:
                         pass
                 break
 
-            # If the child goes silent (shouldn’t; it heartbeats), kill safely
+            # 6) Watchdog: if child goes silent too long, fail safe
             if silent_s > 15.0:
                 log("[launcher] watchdog: noise_generator silent >15s; terminating")
                 try:
