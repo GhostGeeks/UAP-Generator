@@ -757,6 +757,7 @@ def run_module(mod: Module, consume, clear) -> None:
       - uap_caller
       - noise_generator
       - tone_generator
+      - spirit_box
 
     All other modules remain legacy (stdin forwarding only; stdout->log/devnull).
     """
@@ -788,7 +789,8 @@ def run_module(mod: Module, consume, clear) -> None:
     is_uap = (mod.id == "uap_caller")
     is_noise = (mod.id == "noise_generator")
     is_tone = (mod.id == "tone_generator")
-    is_json_ui = is_uap or is_noise or is_tone
+    is_spirit = (mod.id == "spirit_box")
+    is_json_ui = is_uap or is_noise or is_tone or is_spirit
 
     proc = None
     pump = None
@@ -910,8 +912,8 @@ def run_module(mod: Module, consume, clear) -> None:
             def draw_playback() -> None:
                 mm, ss = divmod(int(state.get("elapsed_s") or 0), 60)
                 playing = bool(state.get("playing"))
-                st = "PLAYING" if playing else "READY"
-                oled_message("UAP Caller", [st, f"Time {mm:02d}:{ss:02d}"], "SEL=Play  BACK")
+                stt = "PLAYING" if playing else "READY"
+                oled_message("UAP Caller", [stt, f"Time {mm:02d}:{ss:02d}"], "SEL=Play  BACK")
 
             def apply_msg(msg: Dict[str, Any]) -> None:
                 t = msg.get("type")
@@ -1082,6 +1084,7 @@ def run_module(mod: Module, consume, clear) -> None:
         # Tone Generator JSON UI path
         # =====================================================
         elif is_tone:
+            # (unchanged from your file)
             state: Dict[str, Any] = {
                 "page": "main",
                 "ready": False,
@@ -1225,9 +1228,9 @@ def run_module(mod: Module, consume, clear) -> None:
                     _draw_header(draw, title, status=_status())
                     y0 = 14
                     row_h = 12
-                    for i, label in enumerate(window):
+                    for i, label2 in enumerate(window):
                         selected = (start + i) == idx
-                        _draw_row(draw, y0 + i * row_h, label, selected)
+                        _draw_row(draw, y0 + i * row_h, label2, selected)
                     _draw_footer(draw, "SEL pick  BACK")
                     _draw_toast(draw, toast_text)
 
@@ -1311,6 +1314,111 @@ def run_module(mod: Module, consume, clear) -> None:
                 time.sleep(0.02)
 
         # =====================================================
+        # Spirit Box JSON UI path
+        # =====================================================
+        elif is_spirit:
+            state: Dict[str, Any] = {
+                "page": "main",
+                "ready": False,
+                "sweep_ms": 200,
+                "direction": "fwd",
+                "mode": "scan",
+                "playing": False,
+                "cursor": "rate",
+                "fatal": "",
+            }
+
+            last_msg_time = time.time()
+            last_draw_time = 0.0
+
+            def _dir_disp() -> str:
+                d = str(state.get("direction") or "fwd").lower()
+                return "REV" if d.startswith("r") else "FWD"
+
+            def _mode_disp() -> str:
+                m = str(state.get("mode") or "scan").lower()
+                return "Burst" if m == "burst" else "Scan"
+
+            def draw_main() -> None:
+                sweep_ms = int(state.get("sweep_ms") or 200)
+                playing = bool(state.get("playing"))
+                cursor = str(state.get("cursor") or "rate")
+
+                items = [
+                    ("rate",      f"Sweep Rate: {sweep_ms} ms"),
+                    ("direction", f"Direction:  {_dir_disp()}"),
+                    ("mode",      f"Mode:       {_mode_disp()}"),
+                    ("play",      f"Play:       {'STOP' if playing else 'PLAY'}"),
+                ]
+
+                # only 3 content lines available in oled_message, so we render 3 and use footer hint
+                # show cursor windowed: keep selected line visible
+                keys = [k for (k, _) in items]
+                try:
+                    idx = keys.index(cursor)
+                except Exception:
+                    idx = 0
+                start = max(0, min(idx - 1, len(items) - 3))
+                window = items[start:start + 3]
+
+                lines = []
+                for k, txt in window:
+                    prefix = ">" if k == cursor else " "
+                    lines.append((prefix + txt)[:21])
+
+                oled_message("Spirit Box", lines, "SEL/HOLD chg  BACK")
+
+            def draw_fatal() -> None:
+                msg = (str(state.get("fatal") or "Unknown error"))[:21]
+                oled_message("Spirit Box", ["ERROR", msg, ""], "BACK")
+
+            while proc.poll() is None:
+                msgs = pump.pump(max_bytes=65536, max_lines=200)
+                exit_requested = False
+
+                if msgs:
+                    last_msg_time = time.time()
+
+                for msg in msgs:
+                    t = msg.get("type")
+                    if t == "page":
+                        state["page"] = str(msg.get("name") or state.get("page") or "main")
+                    elif t == "state":
+                        for k in ("ready", "page", "sweep_ms", "direction", "mode", "playing", "cursor"):
+                            if k in msg:
+                                state[k] = msg.get(k)
+                    elif t == "fatal":
+                        state["page"] = "fatal"
+                        state["fatal"] = str(msg.get("message", "fatal"))
+                    elif t == "exit":
+                        exit_requested = True
+
+                now = time.time()
+                if (now - last_draw_time) >= 0.08:
+                    pg = str(state.get("page") or "main")
+                    if pg == "fatal":
+                        draw_fatal()
+                    else:
+                        draw_main()
+                    last_draw_time = now
+
+                if exit_requested:
+                    break
+
+                if hold_first_buttons():
+                    break
+
+                if (now - last_msg_time) > 15.0:
+                    log("[launcher] watchdog: spirit_box silent >15s; terminating")
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
+
+                time.sleep(0.02)
+
+        # =====================================================
         # Normal modules path (legacy stdin forwarding)
         # =====================================================
         else:
@@ -1375,6 +1483,7 @@ def run_module(mod: Module, consume, clear) -> None:
 
         # Child may have left OLED off; recover here
         oled_hard_wake()
+
 
 # =====================================================
 # MAIN

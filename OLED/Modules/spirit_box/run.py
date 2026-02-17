@@ -1,414 +1,647 @@
 #!/usr/bin/env python3
+"""
+BlackBox Spirit Box (headless JSON stdout protocol) - sb_v1
+
+Architecture goals:
+- NO OLED access
+- JSON-only stdout (never print debug)
+- Non-blocking stdin (selectors + os.read)
+- Persistent loop playback of a generated WAV pattern (Noise Generator pattern)
+- Restart audio cleanly when parameters change
+- Detect audio process crash + restart 2-3 times; then fatal
+- Heartbeat state <=250ms
+- Clean exit on back, and on SIGTERM
+
+UI surface (handled by app.py):
+Main page:
+  Spirit Box
+  Sweep Rate: 150/200/250/300 ms
+  Direction: FWD/REV
+  Mode: Scan/Burst (Burst is future; state supported)
+  Play: PLAY/STOP
+
+Controls:
+  up/down: move cursor
+  select: change value (forward)
+  select_hold: change value (reverse)
+  back: exit immediately
+"""
+
+import os
 import sys
-import time
 import json
-import select
-from pathlib import Path
-
-from luma.core.interface.serial import i2c
-from luma.oled.device import ssd1306
-from luma.core.render import canvas
-
-# ============================================================
-# OLED CONFIG
-# ============================================================
-I2C_PORT = 1
-I2C_ADDR = 0x3C
-OLED_W, OLED_H = 128, 64
-
-serial = i2c(port=I2C_PORT, address=I2C_ADDR)
-device = ssd1306(serial, width=OLED_W, height=OLED_H)
-
-# ============================================================
-# FILES
-# ============================================================
-HERE = Path(__file__).resolve().parent
-SETTINGS_FILE = HERE / "settings.json"
-
-DEFAULT_SETTINGS = {
-    "step_mhz": 0.1,          # fixed by request; still stored for future
-    "sweep_ms": 150,          # 50..350 step 50
-    "scan_style": "LOOP",     # LOOP / BOUNCE / RANDOM
-    "volume": 80,             # 0..100 (global)
-}
-
-# ============================================================
-# UI LAYOUT (tuned to avoid footer clipping)
-# ============================================================
-HEADER_Y = 0
-DIVIDER_Y = 12
-
-LIST_Y0 = 14        # content starts just under divider
-ROW_H = 10          # tight spacing to fit more items
-
-FOOTER_LINE_Y = 52  # lifted up
-FOOTER_Y = 54       # lifted up so text is fully visible
+import time
+import wave
+import math
+import errno
+import signal
+import shutil
+import selectors
+import subprocess
+from dataclasses import dataclass
+from typing import Optional, List
 
 
-# ============================================================
-# INPUT (stdin from parent app.py)
-# ============================================================
-def read_event():
-    """
-    Reads one event token from stdin, non-blocking.
-    Expected tokens: up, down, select, select_hold, back
-    """
+MODULE_NAME = "spirit_box"
+MODULE_VERSION = "sb_v1"
+
+AUDIO_ERR = "/tmp/blackbox_spirit_audio.err"
+MODULE_ERR = "/tmp/blackbox_spirit_module.err"
+
+PATTERN_WAV = "/tmp/blackbox_spirit_pattern.wav"
+
+HEARTBEAT_S = 0.25
+TICK_S = 0.02  # <=50ms tick requirement
+
+SWEEP_MS_CHOICES = [150, 200, 250, 300]
+DIR_CHOICES = ["fwd", "rev"]
+MODE_CHOICES = ["scan", "burst"]  # burst is future expansion
+
+CURSOR_CHOICES = ["rate", "direction", "mode", "play"]
+
+# WAV generation
+RATE = 22050
+CHANNELS = 1
+SAMPWIDTH = 2
+PATTERN_SECONDS = 9.0  # ~8-10s requested
+
+# Pulse shape inside each "sweep step" (makes it sound like chopping across slices)
+PULSE_ON_MS = 38
+FADE_MS = 2
+
+# "Frequency slice" simulation for the pattern (not actual FM tuning)
+# Keeps CPU low: simple resonator-ish bandpass feel.
+SLICE_F_MIN = 250.0
+SLICE_F_MAX = 4200.0
+SLICE_R = 0.985  # resonance factor; near 1.0 = narrow band
+
+
+# ---------------- logging (file only) ----------------
+def _log_err(msg: str) -> None:
     try:
-        r, _, _ = select.select([sys.stdin], [], [], 0)
+        with open(MODULE_ERR, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
     except Exception:
-        return None
-    if not r:
-        return None
-    line = sys.stdin.readline()
-    if not line:
-        return None
-    return line.strip()
-
-
-# ============================================================
-# SETTINGS I/O
-# ============================================================
-def load_settings():
-    if SETTINGS_FILE.exists():
-        try:
-            data = json.loads(SETTINGS_FILE.read_text())
-            out = DEFAULT_SETTINGS.copy()
-            out.update(data)
-            return out
-        except Exception:
-            pass
-    save_settings(DEFAULT_SETTINGS.copy())
-    return DEFAULT_SETTINGS.copy()
-
-
-def save_settings(s):
-    try:
-        SETTINGS_FILE.write_text(json.dumps(s, indent=2))
-    except Exception as e:
-        # Fail silently in production so module keeps running
-        # Optional: print(e) for debugging
         pass
 
-# ============================================================
-# UI DRAW HELPERS
-# ============================================================
-def draw_header(d, title: str):
-    d.text((2, HEADER_Y), title[:21], fill=255)
-    d.line((0, DIVIDER_Y, 127, DIVIDER_Y), fill=255)
+
+# ---------------- strict JSON stdout ----------------
+def _emit(obj: dict) -> None:
+    try:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
-def draw_footer(d, text: str):
-    d.line((0, FOOTER_LINE_Y, 127, FOOTER_LINE_Y), fill=255)
-    d.text((2, FOOTER_Y), text[:21], fill=255)
+def _toast(msg: str) -> None:
+    _emit({"type": "toast", "message": msg})
 
 
-def draw_row(d, y: int, text: str, selected: bool = False):
-    # selection marker on left
-    marker = ">" if selected else " "
-    d.text((0, y), marker, fill=255)
-    d.text((10, y), text[:19], fill=255)
+def _fatal(msg: str) -> None:
+    _emit({"type": "fatal", "message": msg})
 
 
-def draw_centered_text(d, y: int, text: str):
-    # crude centering
-    x = max(0, (OLED_W - (len(text) * 6)) // 2)
-    d.text((x, y), text, fill=255)
+# ---------------- stdin reader (non-blocking) ----------------
+class StdinReader:
+    def __init__(self) -> None:
+        self.fd = sys.stdin.fileno()
+        os.set_blocking(self.fd, False)
+        self.sel = selectors.DefaultSelector()
+        self.sel.register(self.fd, selectors.EVENT_READ)
+        self.buf = bytearray()
+
+    def close(self) -> None:
+        try:
+            self.sel.unregister(self.fd)
+        except Exception:
+            pass
+        try:
+            self.sel.close()
+        except Exception:
+            pass
+
+    def read_commands(self, max_bytes: int = 4096) -> List[str]:
+        out: List[str] = []
+        if not self.sel.select(timeout=0):
+            return out
+
+        drained = 0
+        while drained < max_bytes:
+            try:
+                chunk = os.read(self.fd, min(1024, max_bytes - drained))
+            except BlockingIOError:
+                break
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                break
+
+            if not chunk:
+                break
+
+            drained += len(chunk)
+            self.buf.extend(chunk)
+
+            while b"\n" in self.buf:
+                line, _, rest = self.buf.partition(b"\n")
+                self.buf = bytearray(rest)
+                try:
+                    s = line.decode("utf-8", errors="ignore").strip().lower()
+                except Exception:
+                    continue
+                if s:
+                    out.append(s)
+
+        return out
 
 
-def render(draw_fn):
-    with canvas(device) as d:
-        draw_fn(d)
+# ---------------- audio player + loop (Noise Generator style) ----------------
+def _which_player() -> Optional[str]:
+    # Prefer paplay; fallback pw-play; last resort aplay
+    return shutil.which("paplay") or shutil.which("pw-play") or shutil.which("aplay")
 
 
-# ============================================================
-# RADIO CONTROL (STUB for now)
-# ============================================================
-def radio_tune(_freq_mhz: float):
+def _start_audio_loop(player_path: str, wav_path: str) -> subprocess.Popen:
+    try:
+        open(AUDIO_ERR, "a").close()
+    except Exception:
+        pass
+
+    base = os.path.basename(player_path)
+
+    if base == "paplay":
+        play_cmd = f'"{player_path}" "{wav_path}" 1>/dev/null'
+    elif base == "pw-play":
+        play_cmd = f'"{player_path}" "{wav_path}" 1>/dev/null'
+    else:
+        # aplay is noisy; ensure stdout muted and stderr is captured by shell redirection
+        play_cmd = f'"{player_path}" -q "{wav_path}" 1>/dev/null'
+
+    # One persistent loop inside one PGID so stop is immediate via killpg
+    cmd = f'exec 2>>"{AUDIO_ERR}"; while true; do {play_cmd}; done'
+    return subprocess.Popen(
+        ["/bin/sh", "-lc", cmd],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=os.environ.copy(),
+    )
+
+
+def _stop_proc(p: Optional[subprocess.Popen]) -> None:
+    if not p:
+        return
+    try:
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except Exception:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+            t0 = time.time()
+            while time.time() - t0 < 0.20:
+                if p.poll() is not None:
+                    break
+                time.sleep(0.01)
+
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _tail_err(path: str, max_bytes: int = 1800) -> str:
+    try:
+        if not os.path.exists(path):
+            return ""
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes), os.SEEK_SET)
+            data = f.read()
+        return data.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+# ---------------- pattern generator ----------------
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def _write_wav_from_pcm16(path: str, pcm16: bytes, rate: int) -> None:
+    tmp_path = path + ".tmp"
+    with wave.open(tmp_path, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(SAMPWIDTH)
+        wf.setframerate(rate)
+        wf.writeframes(pcm16)
+    os.replace(tmp_path, path)
+
+
+def _gen_spirit_pattern_wav(
+    path: str,
+    sweep_ms: int,
+    direction: str,
+    mode: str,
+) -> None:
     """
-    TODO: Implement TEA5767 tune over I2C.
-    Keeping this stub so UI works now.
+    Generate a ~9s WAV containing pulsed “slice” segments.
+    This is intentionally simple + deterministic to keep CPU low on Pi Zero 2W.
     """
-    return
+
+    sweep_ms = int(sweep_ms)
+    sweep_ms = int(_clamp(sweep_ms, 80, 500))
+    direction = "rev" if str(direction).lower().startswith("r") else "fwd"
+    mode = str(mode).lower().strip()
+    if mode not in MODE_CHOICES:
+        mode = "scan"
+
+    total_frames = int(RATE * PATTERN_SECONDS)
+    step_frames = max(1, int(RATE * (sweep_ms / 1000.0)))
+    on_frames = max(1, int(RATE * (PULSE_ON_MS / 1000.0)))
+    on_frames = min(on_frames, step_frames)
+    off_frames = step_frames - on_frames
+
+    # Fade ramps to reduce clicks
+    fade_frames = max(1, int(RATE * (FADE_MS / 1000.0)))
+    fade_frames = min(fade_frames, max(1, on_frames // 2))
+
+    # Number of steps in pattern
+    n_steps = max(1, total_frames // step_frames)
+
+    # Determine slice frequencies across range
+    # Use a slight non-linear mapping for more variation
+    freqs: List[float] = []
+    for i in range(n_steps):
+        t = i / max(1, (n_steps - 1))
+        # skew towards mid highs a bit
+        u = (0.15 * t) + (0.85 * (t ** 0.6))
+        f = SLICE_F_MIN + u * (SLICE_F_MAX - SLICE_F_MIN)
+        freqs.append(f)
+
+    if direction == "rev":
+        freqs = list(reversed(freqs))
+
+    # Mode: "burst" can inject occasional longer “on” pulses in the future.
+    # For now it just slightly changes the on/off ratio to feel different.
+    if mode == "burst":
+        on_frames = min(step_frames, max(1, int(on_frames * 1.35)))
+        off_frames = step_frames - on_frames
+        fade_frames = min(fade_frames, max(1, on_frames // 2))
+
+    # Simple resonator filter per step:
+    # y[n] = 2*r*cos(w)*y[n-1] - r^2*y[n-2] + (1-r)*x[n]
+    # x[n] is pseudo-random noise (LCG) to be deterministic.
+    r = SLICE_R
+
+    # Deterministic LCG seed derived from parameters
+    seed = (sweep_ms * 1315423911) ^ (0x9E3779B9 if direction == "rev" else 0x1234567) ^ (0xABCDEF if mode == "burst" else 0x13579B)
+    seed &= 0xFFFFFFFF
+
+    def rand_u32() -> int:
+        nonlocal seed
+        # LCG constants
+        seed = (1664525 * seed + 1013904223) & 0xFFFFFFFF
+        return seed
+
+    pcm = bytearray()
+    y1 = 0.0
+    y2 = 0.0
+
+    frames_written = 0
+    for i, fc in enumerate(freqs):
+        if frames_written >= total_frames:
+            break
+
+        w = 2.0 * math.pi * float(fc) / float(RATE)
+        a1 = 2.0 * r * math.cos(w)
+        a2 = -(r * r)
+        b0 = (1.0 - r)
+
+        # ON pulse
+        for n in range(on_frames):
+            if frames_written >= total_frames:
+                break
+
+            # noise in [-1,1]
+            x = (rand_u32() / 2147483648.0) - 1.0
+
+            y = (a1 * y1) + (a2 * y2) + (b0 * x)
+            y2, y1 = y1, y
+
+            # fade in/out
+            g = 1.0
+            if n < fade_frames:
+                g = n / float(fade_frames)
+            elif n > (on_frames - fade_frames):
+                g = max(0.0, (on_frames - n) / float(fade_frames))
+
+            # clamp, scale
+            v = _clamp(y * g * 0.95, -1.0, 1.0)
+            iv = int(v * 32767.0)
+            pcm += int(iv).to_bytes(2, byteorder="little", signed=True)
+            frames_written += 1
+
+        # OFF gap (silence)
+        for _ in range(off_frames):
+            if frames_written >= total_frames:
+                break
+            pcm += (0).to_bytes(2, byteorder="little", signed=True)
+            frames_written += 1
+
+    # If short, pad to full length
+    while frames_written < total_frames:
+        pcm += (0).to_bytes(2, byteorder="little", signed=True)
+        frames_written += 1
+
+    _write_wav_from_pcm16(path, bytes(pcm), RATE)
 
 
-# ============================================================
-# SCREEN: MAIN MENU
-# ============================================================
-def menu_screen(settings, sel_idx: int):
-    items = ["START", "SETTINGS"]
+# ---------------- state ----------------
+@dataclass
+class UIState:
+    page: str = "main"
+    ready: bool = False
 
-    def _draw(d):
-        draw_header(d, "SPIRIT BOX")
+    sweep_ms: int = 200
+    direction: str = "fwd"
+    mode: str = "scan"
+    playing: bool = False
 
-        # clean content block
-        draw_row(d, LIST_Y0 + 0 * ROW_H, items[0], selected=(sel_idx == 0))
-        draw_row(d, LIST_Y0 + 1 * ROW_H, items[1], selected=(sel_idx == 1))
+    cursor: str = "rate"
 
-        # footer
-        draw_footer(d, "SEL choose  BACK exit")
-
-    return items, _draw
-
-
-# ============================================================
-# SCREEN: SETTINGS
-# ============================================================
-def settings_screen(settings, sel_idx: int):
-    """
-    Per request:
-      - each editable item on its own line
-      - no FM band shown
-      - no 'Back' as a menu item
-    """
-    rate = int(settings.get("sweep_ms", 150))
-    style = settings.get("scan_style", "LOOP")
-    vol = int(settings.get("volume", 80))
-
-    lines = [
-        f"Sweep: {rate}ms",
-        f"Style: {style}",
-        f"Vol:   {vol}%",
-    ]
-
-    def _draw(d):
-        draw_header(d, "SETTINGS")
-
-        # visible rows = 3 (fits perfectly with footer lifted)
-        for i, line in enumerate(lines):
-            draw_row(d, LIST_Y0 + i * ROW_H, line, selected=(sel_idx == i))
-
-        draw_footer(d, "SEL edit  BACK menu")
-
-    return lines, _draw
+    # internal
+    _last_toast_t: float = 0.0
+    _restart_tries: int = 0
+    _fatal_active: bool = False
 
 
-# ============================================================
-# EDITORS
-# ============================================================
-def edit_sweep_rate(settings):
-    val = int(settings.get("sweep_ms", 150))
-    MIN_MS, MAX_MS, STEP_MS = 50, 350, 50
+def _emit_page(st: UIState) -> None:
+    _emit({"type": "page", "name": st.page})
 
-    while True:
-        def _draw(d):
-            draw_header(d, "SWEEP RATE")
-            draw_centered_text(d, 26, f"{val} ms")
-            d.text((2, 40), "UP/DN adjust", fill=255)
-            draw_footer(d, "SEL save BACK cancel")
 
-        render(_draw)
+def _emit_state(st: UIState) -> None:
+    _emit({
+        "type": "state",
+        "ready": bool(st.ready),
+        "sweep_ms": int(st.sweep_ms),
+        "direction": str(st.direction),
+        "mode": str(st.mode),
+        "playing": bool(st.playing),
+        "cursor": str(st.cursor),
+    })
 
-        ev = read_event()
-        if ev == "up":
-            val = min(MAX_MS, val + STEP_MS)
-        elif ev == "down":
-            val = max(MIN_MS, val - STEP_MS)
-        elif ev == "select":
-            settings["sweep_ms"] = val
-            save_settings(settings)
+
+def _toast_throttle(st: UIState, msg: str, min_interval_s: float = 0.10) -> None:
+    now = time.monotonic()
+    if now - st._last_toast_t >= min_interval_s:
+        st._last_toast_t = now
+        _toast(msg)
+
+
+def _cycle_choice(cur: str, choices: List[str], delta: int) -> str:
+    cur = str(cur).lower().strip()
+    try:
+        idx = choices.index(cur)
+    except Exception:
+        idx = 0
+    idx = (idx + delta) % len(choices)
+    return choices[idx]
+
+
+def _cycle_int_choice(cur: int, choices: List[int], delta: int) -> int:
+    try:
+        idx = choices.index(int(cur))
+    except Exception:
+        idx = 0
+    idx = (idx + delta) % len(choices)
+    return int(choices[idx])
+
+
+def main() -> int:
+    exiting = {"flag": False}
+
+    def _sig_handler(_signo, _frame):
+        exiting["flag"] = True
+
+    try:
+        signal.signal(signal.SIGTERM, _sig_handler)
+        signal.signal(signal.SIGINT, _sig_handler)
+    except Exception:
+        pass
+
+    reader = StdinReader()
+    st = UIState()
+
+    _emit({"type": "hello", "module": MODULE_NAME, "version": MODULE_VERSION})
+    _emit_page(st)
+
+    player_path = _which_player()
+    if not player_path:
+        st.ready = False
+        _emit_state(st)
+        st._fatal_active = True
+        _fatal("Audio player not available (need paplay/pw-play/aplay)")
+    else:
+        st.ready = True
+        _emit_state(st)
+
+    audio_proc: Optional[subprocess.Popen] = None
+
+    def stop_audio() -> None:
+        nonlocal audio_proc
+        _stop_proc(audio_proc)
+        audio_proc = None
+
+    def build_pattern_or_fatal() -> bool:
+        """
+        Build the WAV synchronously (allowed), but never from inside a tight UI loop
+        other than during a param-change event.
+        """
+        try:
+            _gen_spirit_pattern_wav(PATTERN_WAV, st.sweep_ms, st.direction, st.mode)
+            return True
+        except Exception as e:
+            _log_err(f"pattern_build_failed: {e!r}")
+            st.ready = False
+            st.playing = False
+            st._fatal_active = True
+            _emit_state(st)
+            _fatal("Failed to generate pattern.wav")
+            return False
+
+    def start_audio() -> None:
+        nonlocal audio_proc
+        if not player_path:
+            st.ready = False
+            st.playing = False
+            st._fatal_active = True
+            _emit_state(st)
+            _fatal("Audio device not available")
             return
-        elif ev == "back":
+
+        if not build_pattern_or_fatal():
             return
 
-        time.sleep(0.03)
+        stop_audio()
 
-
-def edit_scan_style(settings):
-    options = ["LOOP", "BOUNCE", "RANDOM"]
-    cur = settings.get("scan_style", "LOOP")
-    idx = options.index(cur) if cur in options else 0
-
-    while True:
-        def _draw(d):
-            draw_header(d, "SCAN STYLE")
-            for i, opt in enumerate(options):
-                draw_row(d, LIST_Y0 + i * ROW_H, opt, selected=(i == idx))
-            draw_footer(d, "SEL save BACK cancel")
-
-        render(_draw)
-
-        ev = read_event()
-        if ev == "up":
-            idx = (idx - 1) % len(options)
-        elif ev == "down":
-            idx = (idx + 1) % len(options)
-        elif ev == "select":
-            settings["scan_style"] = options[idx]
-            save_settings(settings)
-            return
-        elif ev == "back":
+        try:
+            audio_proc = _start_audio_loop(player_path, PATTERN_WAV)
+        except Exception as e:
+            _log_err(f"audio_start_failed: {e!r}")
+            st.ready = False
+            st.playing = False
+            st._fatal_active = True
+            _emit_state(st)
+            _fatal("Failed to start audio loop")
+            audio_proc = None
             return
 
-        time.sleep(0.03)
+        st._restart_tries = 0
 
+    def restart_audio_on_param_change() -> None:
+        # Only restart if playing; otherwise just rebuild on next play
+        if st.playing:
+            start_audio()
 
-def edit_volume(settings):
-    val = int(settings.get("volume", 80))
-    val = max(0, min(100, val))
+    def cleanup_files() -> None:
+        try:
+            if os.path.exists(PATTERN_WAV):
+                os.remove(PATTERN_WAV)
+        except Exception:
+            pass
 
-    while True:
-        def _draw(d):
-            draw_header(d, "VOLUME")
-            draw_centered_text(d, 26, f"{val}%")
-            d.text((2, 40), "UP/DN adjust", fill=255)
-            draw_footer(d, "SEL save BACK cancel")
+    last_hb = 0.0
+    last_tick = time.monotonic()
 
-        render(_draw)
+    try:
+        while not exiting["flag"]:
+            now = time.monotonic()
 
-        ev = read_event()
-        if ev == "up":
-            val = min(100, val + 5)
-        elif ev == "down":
-            val = max(0, val - 5)
-        elif ev == "select":
-            settings["volume"] = val
-            save_settings(settings)
-            return
-        elif ev == "back":
-            return
+            # ---------- process stdin (never blocking) ----------
+            cmds = reader.read_commands()
+            for cmd in cmds:
+                if cmd == "back":
+                    exiting["flag"] = True
+                    break
 
-        time.sleep(0.03)
+                # ignore inputs if fatal is active? allow navigation still so user can back out
+                if cmd == "up":
+                    try:
+                        idx = CURSOR_CHOICES.index(st.cursor)
+                    except Exception:
+                        idx = 0
+                    st.cursor = CURSOR_CHOICES[(idx - 1) % len(CURSOR_CHOICES)]
+                    _emit_state(st)
 
+                elif cmd == "down":
+                    try:
+                        idx = CURSOR_CHOICES.index(st.cursor)
+                    except Exception:
+                        idx = 0
+                    st.cursor = CURSOR_CHOICES[(idx + 1) % len(CURSOR_CHOICES)]
+                    _emit_state(st)
 
-# ============================================================
-# SCREEN: FM SWEEP (freq only)
-# ============================================================
-def sweep_screen(freq_mhz: float):
-    def _draw(d):
-        draw_header(d, "FM SWEEP")
+                elif cmd in ("select", "select_hold"):
+                    delta = +1 if cmd == "select" else -1
 
-        # freq only, big and centered
-        draw_centered_text(d, 26, f"{freq_mhz:.1f} MHz")
+                    if st.cursor == "rate":
+                        st.sweep_ms = _cycle_int_choice(st.sweep_ms, SWEEP_MS_CHOICES, delta)
+                        _toast_throttle(st, f"Sweep: {st.sweep_ms}ms")
+                        _emit_state(st)
+                        restart_audio_on_param_change()
 
-        # no sweep rate / style displayed (per request)
-        draw_footer(d, "BACK stop  HOLD settings")
+                    elif st.cursor == "direction":
+                        st.direction = _cycle_choice(st.direction, DIR_CHOICES, delta)
+                        _toast_throttle(st, f"Direction: {'REV' if st.direction=='rev' else 'FWD'}")
+                        _emit_state(st)
+                        restart_audio_on_param_change()
 
-    return _draw
+                    elif st.cursor == "mode":
+                        st.mode = _cycle_choice(st.mode, MODE_CHOICES, delta)
+                        _toast_throttle(st, f"Mode: {st.mode.upper()}")
+                        _emit_state(st)
+                        restart_audio_on_param_change()
 
+                    elif st.cursor == "play":
+                        if st.playing:
+                            st.playing = False
+                            _emit_state(st)
+                            stop_audio()
+                            _toast_throttle(st, "STOP")
+                        else:
+                            st.playing = True
+                            _emit_state(st)
+                            start_audio()
+                            # if audio failed, st.playing will still be true; normalize it
+                            if audio_proc is None:
+                                st.playing = False
+                                _emit_state(st)
+                            else:
+                                _toast_throttle(st, "PLAY")
 
-# ============================================================
-# FLOW: SETTINGS
-# ============================================================
-def settings_flow(settings):
-    sel = 0
-    while True:
-        lines, draw_fn = settings_screen(settings, sel)
-        render(draw_fn)
+            # ---------- monitor audio proc (crash detection + restart) ----------
+            if st.playing and audio_proc is not None:
+                rc = audio_proc.poll()
+                if rc is not None:
+                    err_tail = _tail_err(AUDIO_ERR)
+                    _log_err(f"audio_proc_died rc={rc} tail={err_tail[-400:]!r}")
 
-        ev = read_event()
-        if ev == "up":
-            sel = (sel - 1) % len(lines)
-        elif ev == "down":
-            sel = (sel + 1) % len(lines)
-        elif ev == "back":
-            # BACK returns to Spirit Box menu (not exiting module)
-            return "MENU"
-        elif ev == "select":
-            if sel == 0:
-                edit_sweep_rate(settings)
-            elif sel == 1:
-                edit_scan_style(settings)
-            elif sel == 2:
-                edit_volume(settings)
+                    st._restart_tries += 1
+                    if st._restart_tries <= 3:
+                        _toast_throttle(st, f"Audio restart {st._restart_tries}/3")
+                        # attempt restart
+                        start_audio()
+                        if audio_proc is None:
+                            # failed to restart
+                            pass
+                    else:
+                        st.ready = False
+                        st.playing = False
+                        st._fatal_active = True
+                        _emit_state(st)
+                        stop_audio()
+                        _fatal("Audio crashed repeatedly")
+                        # remain alive so BACK works
 
-        time.sleep(0.05)
+            # ---------- heartbeat state (<=250ms) ----------
+            if (now - last_hb) >= HEARTBEAT_S:
+                _emit_state(st)
+                last_hb = now
 
+            # ---------- tick pacing (<=50ms sleeps) ----------
+            elapsed = now - last_tick
+            last_tick = now
+            if elapsed < TICK_S:
+                time.sleep(TICK_S - elapsed)
 
-# ============================================================
-# FLOW: SWEEP
-# ============================================================
-def sweep_flow(settings):
-    # fixed full range as requested
-    FMIN, FMAX = 76.0, 108.0
-    step = float(settings.get("step_mhz", 0.1))
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
+        try:
+            stop_audio()
+        except Exception:
+            pass
+        cleanup_files()
+        _emit({"type": "exit"})
 
-    freq = FMIN
-    direction = 1
-
-    while True:
-        radio_tune(freq)
-        render(sweep_screen(freq))
-
-        ev = read_event()
-        if ev == "back":
-            # BACK returns to Spirit Box menu (not exiting module)
-            return "MENU"
-        if ev == "select_hold":
-            # quick access to settings; return back to sweep after
-            next_state = settings_flow(settings)
-            if next_state == "MENU":
-                # user backed out of settings -> go back to sweep
-                pass
-
-        style = settings.get("scan_style", "LOOP")
-
-        # advance
-        if style == "LOOP":
-            freq += step
-            if freq > FMAX:
-                freq = FMIN
-
-        elif style == "BOUNCE":
-            freq += step * direction
-            if freq >= FMAX:
-                freq = FMAX
-                direction = -1
-            elif freq <= FMIN:
-                freq = FMIN
-                direction = 1
-
-        else:  # RANDOM
-            span = max(0.1, (FMAX - FMIN))
-            # deterministic pseudo-random hop (no imports)
-            freq = FMIN + ((freq * 13.7 + 1.3) % span)
-
-        delay = max(0.05, int(settings.get("sweep_ms", 150)) / 1000.0)
-        time.sleep(delay)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-def main():
-    settings = load_settings()
-
-    state = "MENU"
-    menu_sel = 0
-
-    while True:
-        if state == "MENU":
-            items, draw_fn = menu_screen(settings, menu_sel)
-            render(draw_fn)
-
-            ev = read_event()
-            if ev == "up":
-                menu_sel = (menu_sel - 1) % len(items)
-            elif ev == "down":
-                menu_sel = (menu_sel + 1) % len(items)
-            elif ev == "select":
-                state = "SWEEP" if menu_sel == 0 else "SETTINGS"
-            elif ev == "back":
-                # BACK from initial Spirit Box menu exits module
-                def _draw(d):
-                    draw_header(d, "SPIRIT BOX")
-                    draw_centered_text(d, 28, "Returning...")
-                    draw_footer(d, " ")
-                render(_draw)
-                time.sleep(0.2)
-                return
-
-
-            time.sleep(0.05)
-
-        elif state == "SETTINGS":
-            state = settings_flow(settings)
-
-        elif state == "SWEEP":
-            state = sweep_flow(settings)
-
-        else:
-            state = "MENU"
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
