@@ -854,13 +854,207 @@ def run_module(mod: Module, consume, clear) -> None:
         except Exception:
             pass
 
-    # -----------------------------
-    # Noise Generator JSON UI path (unchanged)
+        # -----------------------------
+    # Noise Generator JSON UI path
     # -----------------------------
     elif is_noise:
-        # keep your existing noise block unchanged from your file
-        # ... your current noise block here ...
-        pass
+        pump = None
+        try:
+            if proc.stdout is None:
+                raise RuntimeError("noise_generator requires stdout=PIPE")
+            pump = StdoutJSONPump(proc.stdout, log)
+        except Exception as e:
+            log(f"[launcher] pump_init_failed: {e!r}")
+            oled_message("Noise Gen", ["Pump init failed", str(e)[:21], ""], "BACK")
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            time.sleep(1.0)
+            oled_hard_wake()
+            return
+
+        state: Dict[str, Any] = {
+            "page": "main",
+            "ready": False,
+            "noise_type": "white",
+            "pulse_ms": 200,
+            "volume": 70,
+            "playing": False,
+            "cursor": "noise",   # noise|rate|volume|play
+            "toast": "",
+            "toast_until": 0.0,
+            "fatal": "",
+        }
+
+        last_msg_time = time.time()
+        last_draw_time = 0.0
+
+        def toast_active() -> str:
+            now = time.time()
+            if state.get("toast") and now < float(state.get("toast_until") or 0.0):
+                return str(state.get("toast") or "")[:21]
+            return ""
+
+        def draw_main() -> None:
+            noise_raw = str(state.get("noise_type") or "white").strip().lower()
+            if noise_raw == "white":
+                noise_disp = "White"
+            elif noise_raw == "pink":
+                noise_disp = "Pink"
+            elif noise_raw == "brown":
+                noise_disp = "Brown"
+            else:
+                noise_disp = (noise_raw[:1].upper() + noise_raw[1:]) if noise_raw else "White"
+
+            pulse_ms = int(state.get("pulse_ms") or 200)
+            vol = int(state.get("volume") or 0)
+            vol = max(0, min(100, vol))
+            playing = bool(state.get("playing"))
+            cursor = str(state.get("cursor") or "noise")
+
+            items = [
+                ("noise",  f"Noise Type: {noise_disp}"),
+                ("rate",   f"Sweep Rate: {pulse_ms}ms"),
+                ("volume", f"Volume:     {vol}%"),
+                ("play",   f"Play:       {'STOP' if playing else 'PLAY'}"),
+            ]
+
+            # Window: title + 3 lines. Show 3 at a time; shift when cursor is on 4th row.
+            idx = 0
+            for i, (k, _) in enumerate(items):
+                if k == cursor:
+                    idx = i
+                    break
+            start = 0 if idx < 3 else 1
+            view = items[start:start + 3]
+
+            lines = []
+            for k, text in view:
+                prefix = ">" if k == cursor else " "
+                lines.append((prefix + text)[:21])
+
+            # Toast overlay without double-drawing (prevents “flashing other lines”)
+            t = toast_active()
+            if t:
+                lines[2] = t[:21]
+
+            footer = "UP/DN=Move SEL=Set"
+            oled_message("Noise Generator", lines, footer)
+
+        def draw_fatal() -> None:
+            msg = (str(state.get("fatal") or "Unknown error"))[:21]
+            oled_message("Noise Gen", ["ERROR", msg, ""], "BACK")
+
+        # Main noise loop
+        while proc.poll() is None:
+            msgs = pump.pump(max_bytes=65536, max_lines=160)
+            if msgs:
+                last_msg_time = time.time()
+
+            exit_requested = False
+
+            for msg in msgs:
+                t = msg.get("type")
+
+                if t == "page":
+                    state["page"] = msg.get("name", state.get("page", "main"))
+
+                elif t == "state":
+                    # Match keys emitted by noise_generator/run.py
+                    if "ready" in msg:
+                        state["ready"] = bool(msg.get("ready"))
+                    if "noise_type" in msg:
+                        state["noise_type"] = str(msg.get("noise_type") or state.get("noise_type") or "white")
+                    if "pulse_ms" in msg:
+                        try:
+                            state["pulse_ms"] = int(msg.get("pulse_ms"))
+                        except Exception:
+                            pass
+                    if "volume" in msg:
+                        try:
+                            state["volume"] = int(msg.get("volume"))
+                        except Exception:
+                            pass
+                    if "playing" in msg:
+                        state["playing"] = bool(msg.get("playing"))
+                    if "cursor" in msg:
+                        state["cursor"] = str(msg.get("cursor") or state.get("cursor") or "noise")
+
+                elif t == "toast":
+                    txt = str(msg.get("message") or "")[:21]
+                    if txt:
+                        state["toast"] = txt
+                        state["toast_until"] = time.time() + 1.2
+
+                elif t == "fatal":
+                    state["page"] = "fatal"
+                    state["fatal"] = str(msg.get("message", "fatal"))
+                    state["toast"] = state["fatal"][:21]
+                    state["toast_until"] = time.time() + 2.0
+
+                elif t == "exit":
+                    exit_requested = True
+
+            now = time.time()
+            silent_s = now - last_msg_time
+
+            # Draw at ~12fps max (prevents flicker)
+            if (now - last_draw_time) >= 0.08:
+                if str(state.get("page") or "main") == "fatal":
+                    draw_fatal()
+                else:
+                    draw_main()
+                last_draw_time = now
+
+            if exit_requested:
+                # allow graceful child exit
+                for _ in range(25):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                break
+
+            # Forward buttons
+            if consume("up"):
+                send("up")
+            if consume("down"):
+                send("down")
+            if consume("select"):
+                send("select")
+            if consume("select_hold"):
+                send("select_hold")
+
+            if consume("back"):
+                send("back")
+                for _ in range(50):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                break
+
+            # If the child goes silent (shouldn’t; it heartbeats), kill safely
+            if silent_s > 15.0:
+                log("[launcher] watchdog: noise_generator silent >15s; terminating")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
+            time.sleep(0.02)
+
+        # Cleanup pump/stdout
+        try:
+            if pump:
+                pump.close()
+        except Exception:
+            pass
 
     # -----------------------------
     # Tone Generator JSON UI path (NEW)
