@@ -14,6 +14,11 @@ Based on sb_v1 structure:
 - Heartbeat state <=250ms
 - Clean exit on back, and on SIGTERM
 
+NEW in this replacement:
+- Optional Bluetooth playback via PipeWire/Pulse default sink:
+  arecord (raw) -> paplay --raw ... /dev/stdin
+- Robust fallback: if BT disconnects / paplay dies, capture continues.
+
 UI surface (handled by app.py):
 Main page:
   Spirit Box
@@ -29,7 +34,7 @@ Controls:
   back: exit immediately
 
 Note:
-- "Play" toggles Sweep+Capture.
+- "Play" toggles Sweep+Capture (+ Playback if enabled).
 - Adds state fields: freq_mhz, level, tea_ok, alsa_ok
 """
 
@@ -48,7 +53,7 @@ from typing import Optional, List, Deque
 from collections import deque
 
 MODULE_NAME = "spirit_box"
-MODULE_VERSION = "sb_v2_real"
+MODULE_VERSION = "sb_v2_real_bt"
 
 MODULE_ERR = "/tmp/blackbox_spirit_module.err"
 AUDIO_ERR  = "/tmp/blackbox_spirit_audio.err"
@@ -80,6 +85,7 @@ FM_MIN = 87.5
 FM_MAX = 108.0
 FM_STEP = 0.2  # MHz per step; tweak to match your desired "chop"
 
+
 # ---------------- logging (file only) ----------------
 def _log_err(msg: str) -> None:
     try:
@@ -87,6 +93,7 @@ def _log_err(msg: str) -> None:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
     except Exception:
         pass
+
 
 # ---------------- strict JSON stdout ----------------
 def _emit(obj: dict) -> None:
@@ -101,6 +108,7 @@ def _toast(msg: str) -> None:
 
 def _fatal(msg: str) -> None:
     _emit({"type": "fatal", "message": msg})
+
 
 # ---------------- stdin reader (non-blocking) ----------------
 class StdinReader:
@@ -155,6 +163,7 @@ class StdinReader:
 
         return out
 
+
 # ---------------- ring buffer (raw PCM) ----------------
 class PCMRing:
     def __init__(self, max_bytes: int):
@@ -176,7 +185,6 @@ class PCMRing:
         with self.lock:
             if want <= 0:
                 return b""
-            # join from end until enough
             out = bytearray()
             for block in reversed(self.q):
                 out[:0] = block  # prepend
@@ -186,17 +194,30 @@ class PCMRing:
                 out = out[-want:]
             return bytes(out)
 
+
 # ---------------- Pulse playback (PipeWire/PulseAudio) ----------------
 class PulsePlayback:
+    """
+    Plays raw PCM to the default Pulse sink (PipeWire's PulseAudio server).
+    Your system default sink is BT (bluez_output...), so this becomes BT playback automatically.
+    """
     def __init__(self):
         self.proc: Optional[subprocess.Popen] = None
         self.ok = False
+        self._last_start = 0.0
 
     def start(self) -> None:
+        # simple backoff to avoid tight restart loops if BT is missing
+        now = time.monotonic()
+        if now - self._last_start < 0.5:
+            return
+        self._last_start = now
+
         if self.proc and self.proc.poll() is None:
             self.ok = True
             return
-        # paplay reads from a file path; /dev/stdin works for piped data
+
+        # IMPORTANT: paplay expects a path; /dev/stdin works for piped audio.
         cmd = [
             "paplay",
             "--raw",
@@ -215,7 +236,8 @@ class PulsePlayback:
                 close_fds=True,
             )
             self.ok = True
-        except Exception:
+        except Exception as e:
+            _log_err(f"paplay_start_failed: {e!r}")
             self.proc = None
             self.ok = False
 
@@ -228,7 +250,8 @@ class PulsePlayback:
         try:
             if p.poll() is None:
                 try:
-                    p.stdin.close()
+                    if p.stdin:
+                        p.stdin.close()
                 except Exception:
                     pass
                 try:
@@ -244,9 +267,14 @@ class PulsePlayback:
             self.ok = False
             return
         try:
+            if not p.stdin:
+                self.ok = False
+                return
             p.stdin.write(data)
+            # no need to flush every chunk; pipe is unbuffered-ish with bufsize=0
         except Exception:
             self.ok = False
+
 
 # ---------------- ALSA capture (arecord raw) ----------------
 class ALSACapture:
@@ -262,16 +290,26 @@ class ALSACapture:
         self.alsa_ok = False
         self._restart_tries = 0
 
+        # Playback (optional)
+        self.playback = PulsePlayback()
+        self.play_audio = True  # set False if you want capture-only
+
     def start(self) -> None:
         if self.t and self.t.is_alive():
             return
         self.stop_ev.clear()
         self._spawn()
+        if self.play_audio:
+            self.playback.start()
         self.t = threading.Thread(target=self._loop, daemon=True)
         self.t.start()
 
     def stop(self) -> None:
         self.stop_ev.set()
+        try:
+            self.playback.stop()
+        except Exception:
+            pass
         self._stop_proc()
         if self.t:
             self.t.join(timeout=1.0)
@@ -340,16 +378,27 @@ class ALSACapture:
                 self.alsa_ok = True
                 data = out.read(CHUNK_BYTES)
                 if not data:
-                    # process ended or pipe broke
                     raise RuntimeError("arecord produced no data")
 
                 self.level = _compute_level_fast(data)
                 self.ring.push(data)
 
+                # ---- BT playback (PipeWire/Pulse default sink) ----
+                if self.play_audio:
+                    if not self.playback.ok:
+                        self.playback.start()
+                    if self.playback.ok:
+                        self.playback.write(data)
+
             except Exception as e:
                 self.alsa_ok = False
                 rc = self.proc.poll() if self.proc else None
                 _log_err(f"arecord_error rc={rc} err={e!r}")
+
+                try:
+                    self.playback.stop()
+                except Exception:
+                    pass
 
                 self._stop_proc()
                 self.proc = None
@@ -359,11 +408,14 @@ class ALSACapture:
                     time.sleep(0.10)
                     try:
                         self._spawn()
+                        if self.play_audio:
+                            self.playback.start()
                     except Exception as e2:
                         _log_err(f"arecord_respawn_failed: {e2!r}")
                         break
                 else:
                     break
+
 
 def _compute_level_fast(pcm: bytes) -> int:
     # peak meter from int16, stride for low CPU
@@ -378,6 +430,7 @@ def _compute_level_fast(pcm: bytes) -> int:
             peak = a
     return int(min(100, (peak / 32767.0) * 100))
 
+
 def _write_wav(path: str, pcm: bytes) -> None:
     tmp = path + ".tmp"
     with wave.open(tmp, "wb") as wf:
@@ -386,6 +439,7 @@ def _write_wav(path: str, pcm: bytes) -> None:
         wf.setframerate(CAP_RATE)
         wf.writeframes(pcm)
     os.replace(tmp, path)
+
 
 # ---------------- TEA tuner (real impl + stub) ----------------
 class TEATunerBase:
@@ -415,7 +469,6 @@ class TEA5767I2C(TEATunerBase):
     def probe(self) -> bool:
         try:
             self._open()
-            # Read 5 status bytes (TEA5767 supports reading)
             os.read(self.fd, 5)
             return True
         except Exception:
@@ -423,9 +476,6 @@ class TEA5767I2C(TEATunerBase):
             return False
 
     def set_freq_mhz(self, mhz: float) -> bool:
-        # TEA5767 freq word: PLL = 4*(f_rf + IF)/f_ref
-        # Common: IF=225kHz, f_ref=32.768kHz
-        # This is a best-effort implementation; verify with your module.
         try:
             self._open()
             f_rf = float(mhz) * 1_000_000.0
@@ -433,18 +483,10 @@ class TEA5767I2C(TEATunerBase):
             f_ref = 32_768.0
             pll = int((4.0 * (f_rf + IF)) / f_ref) & 0x3FFF
 
-            # 5 bytes control:
-            # Byte0: MUTE(1)/SM(1)/PLL[13:8]
-            # Byte1: PLL[7:0]
-            # Byte2: SUD/SSL1/SSL0/HLS/.. (we keep defaults)
-            # Byte3: ... (defaults)
-            # Byte4: ... (defaults)
-            b0 = ((pll >> 8) & 0x3F)  # PLL high 6 bits
+            b0 = ((pll >> 8) & 0x3F)
             b1 = pll & 0xFF
-            # Set "search mode" off, mute off here (mute via mute())
-            # We'll use a conservative default config
             b0 |= 0x00
-            b2 = 0xB0  # typical: high side injection + stereo + soft mute config-ish
+            b2 = 0xB0
             b3 = 0x10
             b4 = 0x00
 
@@ -456,8 +498,6 @@ class TEA5767I2C(TEATunerBase):
             return False
 
     def mute(self, on: bool) -> None:
-        # If you need true mute on TEA5767, re-send last PLL with MUTE bit set.
-        # For now we no-op to keep things safe.
         pass
 
     def _open(self) -> None:
@@ -465,7 +505,6 @@ class TEA5767I2C(TEATunerBase):
             return
         path = f"/dev/i2c-{self.bus}"
         self.fd = os.open(path, os.O_RDWR)
-        # I2C_SLAVE = 0x0703
         import fcntl
         fcntl.ioctl(self.fd, 0x0703, self.addr)
 
@@ -476,6 +515,7 @@ class TEA5767I2C(TEATunerBase):
             except Exception:
                 pass
         self.fd = None
+
 
 # ---------------- state ----------------
 @dataclass
@@ -500,8 +540,10 @@ class UIState:
     _fatal_active: bool = False
     _last_step_t: float = 0.0
 
+
 def _emit_page(st: UIState) -> None:
     _emit({"type": "page", "name": st.page})
+
 
 def _emit_state(st: UIState) -> None:
     _emit({
@@ -519,11 +561,13 @@ def _emit_state(st: UIState) -> None:
         "alsa_ok": bool(st.alsa_ok),
     })
 
+
 def _toast_throttle(st: UIState, msg: str, min_interval_s: float = 0.10) -> None:
     now = time.monotonic()
     if now - st._last_toast_t >= min_interval_s:
         st._last_toast_t = now
         _toast(msg)
+
 
 def _cycle_choice(cur: str, choices: List[str], delta: int) -> str:
     cur = str(cur).lower().strip()
@@ -534,6 +578,7 @@ def _cycle_choice(cur: str, choices: List[str], delta: int) -> str:
     idx = (idx + delta) % len(choices)
     return choices[idx]
 
+
 def _cycle_int_choice(cur: int, choices: List[int], delta: int) -> int:
     try:
         idx = choices.index(int(cur))
@@ -541,6 +586,7 @@ def _cycle_int_choice(cur: int, choices: List[int], delta: int) -> int:
         idx = 0
     idx = (idx + delta) % len(choices)
     return int(choices[idx])
+
 
 def _step_freq(freq: float, direction: str) -> float:
     if direction == "rev":
@@ -553,6 +599,7 @@ def _step_freq(freq: float, direction: str) -> float:
         if f > FM_MAX:
             f = FM_MIN
         return f
+
 
 def main() -> int:
     exiting = {"flag": False}
@@ -573,23 +620,20 @@ def main() -> int:
     _emit_page(st)
 
     # -------- initialize tuner backend --------
-    # Try TEA5767 over i2c-1; fallback to stub.
     tuner: TEATunerBase = TEA5767I2C(bus=1, addr=0x60)
     st.tea_ok = tuner.probe()
     if not st.tea_ok:
         tuner = TEATunerStub()
-        st.tea_ok = False  # explicit
+        st.tea_ok = False
         _log_err("TEA probe failed; using stub backend")
 
     # -------- initialize capture --------
     cap = ALSACapture()
 
-    # If TEA is absent, module still "ready" so user can exit + see message.
     st.ready = True
     _emit_state(st)
 
     def start_real() -> None:
-        # Start capture + set tuner to current frequency
         try:
             ok = tuner.set_freq_mhz(st.freq_mhz)
             if st.tea_ok and not ok:
@@ -600,8 +644,6 @@ def main() -> int:
             cap.start()
         except Exception as e:
             _log_err(f"cap_start_exc: {e!r}")
-
-        # quick snapshot to ensure we’re running
         time.sleep(0.02)
 
     def stop_real() -> None:
@@ -670,7 +712,6 @@ def main() -> int:
                             _emit_state(st)
                             start_real()
 
-                            # If capture immediately fails, normalize
                             if not cap.t or not cap.t.is_alive():
                                 st.playing = False
                                 _emit_state(st)
@@ -678,8 +719,6 @@ def main() -> int:
                             else:
                                 _toast_throttle(st, "PLAY")
 
-                            # Bonus: holding select on PLAY while stopped makes a quick snapshot WAV
-                            # (kept minimal: only on select_hold when stopped)
                     # Optional quick snapshot shortcut:
                     if st.cursor == "play" and cmd == "select_hold" and not st.playing:
                         try:
@@ -695,28 +734,23 @@ def main() -> int:
 
             # ---------- sweep step timing (non-blocking) ----------
             if st.playing:
-                # Update from capture
                 st.level = int(cap.level)
                 st.alsa_ok = bool(cap.alsa_ok)
 
-                # Step tuner at sweep_ms interval
                 if (now - st._last_step_t) >= (st.sweep_ms / 1000.0):
                     st._last_step_t = now
                     st.freq_mhz = _step_freq(st.freq_mhz, st.direction)
-                    # attempt tune; if stub, it's fine
                     try:
                         tuner.set_freq_mhz(st.freq_mhz)
                     except Exception as e:
                         _log_err(f"tune_exc: {e!r}")
 
-                # If arecord thread died hard, fatal but keep loop alive so BACK works
                 if cap.t and (not cap.t.is_alive()) and not st._fatal_active:
                     st._fatal_active = True
                     st.ready = False
                     st.playing = False
                     _emit_state(st)
                     _fatal("ALSA capture crashed repeatedly")
-
             else:
                 st.level = int(cap.level)
                 st.alsa_ok = bool(cap.alsa_ok)
@@ -744,6 +778,7 @@ def main() -> int:
         _emit({"type": "exit"})
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
